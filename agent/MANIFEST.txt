@@ -63,6 +63,9 @@ channels/telegram/typing-keepalive.ts	agent	644
 mount-store/mount-store.ts	agent	644
 mount-store/package.json	agent	644
 
+# Scheduled-tasks store (tasks.json reader/writer; imported by poller.ts)
+tasks-store/tasks-store.ts	agent	644
+
 # Shared path resolver
 lib/paths.ts	agent	644
 

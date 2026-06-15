@@ -163,7 +163,7 @@ rm -f "$BIN_DIR/restart_claude.sh" 2>/dev/null || true
 # ~/.local/share).
 AGENT_DIR="$INSTALL_DIR/agent"
 if [[ -d "$REPO_DIR/agent" ]]; then
-  mkdir -p "$AGENT_DIR/lib" "$AGENT_DIR/poller" "$AGENT_DIR/poller/heartbeat-checks" "$AGENT_DIR/poller/agentic" "$AGENT_DIR/mount-store" "$AGENT_DIR/channels/telegram"
+  mkdir -p "$AGENT_DIR/lib" "$AGENT_DIR/poller" "$AGENT_DIR/poller/heartbeat-checks" "$AGENT_DIR/poller/agentic" "$AGENT_DIR/mount-store" "$AGENT_DIR/tasks-store" "$AGENT_DIR/channels/telegram"
   cp "$REPO_DIR/agent/lib/paths.ts" "$AGENT_DIR/lib/"
   cp "$REPO_DIR/agent/poller/poller.ts" \
      "$REPO_DIR/agent/poller/package.json" \
@@ -211,6 +211,9 @@ if [[ -d "$REPO_DIR/agent" ]]; then
      "$REPO_DIR/agent/channels/telegram/typing-keepalive.ts" \
      "$AGENT_DIR/channels/telegram/"
   cp "$REPO_DIR/agent/mount-store/mount-store.ts" "$REPO_DIR/agent/mount-store/package.json" "$AGENT_DIR/mount-store/"
+  # Scheduled-tasks store. poller.ts imports ../tasks-store/tasks-store; without
+  # this copy the installed poller crashes on startup ("Cannot find module").
+  cp "$REPO_DIR/agent/tasks-store/tasks-store.ts" "$AGENT_DIR/tasks-store/"
   # Phase 4 (2026-05-19): picker-watcher.ts removed (daemons via stream-json
   # own dispatch now). Delete any leftover from a stale install.
   rm -f "$AGENT_DIR/picker-watcher.ts" 2>/dev/null || true
