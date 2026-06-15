@@ -162,7 +162,18 @@ export function buildGateEnv(opts: {
   };
 }
 
-interface StreamAccum { finalText: string; totalCostUsd: number; }
+interface StreamAccum { finalText: string; totalCostUsd: number; resultError: string | null; }
+
+/** True when a resume failed because the session itself is unusable — the
+ *  conversation file is gone, or it's pinned to a model that's now unavailable
+ *  (e.g. an access-gated model). The cure is to drop the session pointer and
+ *  start fresh, not to surface the error. Used by the poller's self-heal. */
+export function isSessionUnusableError(msg?: string): boolean {
+  if (!msg) return false;
+  return /no conversation found/i.test(msg)
+    || /is currently unavailable/i.test(msg)
+    || /\bmodel\b.*(unavailable|not found|unknown|no longer)/i.test(msg);
+}
 
 /** Parse newline-delimited stream-json incrementally, emitting assistant text via onText. */
 export function makeStreamHandler(onText?: (t: string) => void): {
@@ -172,6 +183,7 @@ export function makeStreamHandler(onText?: (t: string) => void): {
   let buf = "";
   let finalText = "";
   let totalCostUsd = 0;
+  let resultError: string | null = null;
   const handleLine = (line: string) => {
     const t = line.trim();
     if (!t) return;
@@ -187,6 +199,10 @@ export function makeStreamHandler(onText?: (t: string) => void): {
       }
     } else if (e.type === "result") {
       if (typeof e.total_cost_usd === "number") totalCostUsd = e.total_cost_usd;
+      // claude reports model-unavailable / rate-limit failures in the result
+      // event (is_error:true, result:<reason>), NOT on stderr. Capture it so the
+      // exit-code error message carries the real reason instead of being blank.
+      if (e.is_error === true && typeof e.result === "string" && e.result) resultError = e.result;
     }
   };
   return {
@@ -200,7 +216,7 @@ export function makeStreamHandler(onText?: (t: string) => void): {
     },
     flush() {
       if (buf.trim()) { handleLine(buf); buf = ""; }
-      return { finalText, totalCostUsd };
+      return { finalText, totalCostUsd, resultError };
     },
   };
 }
@@ -272,14 +288,18 @@ export async function runAgentic(opts: AgenticRunOpts): Promise<AgenticResult> {
     await drainPromise;
     clearTimeout(sigTermTimer);
     clearTimeout(sigKillTimer);
-    const { finalText, totalCostUsd } = handler.flush();
+    const { finalText, totalCostUsd, resultError } = handler.flush();
 
     if (killEscalated) {
       return { status: "timeout", finalText: finalText || null, totalCostUsd, durationMs: Date.now() - startedAt, errorMessage: `agentic run exceeded ${sigKillMs}ms` };
     }
     if (exitCode !== 0 && !termFired) {
       const stderr = proc.stderr ? await new Response(proc.stderr).text() : "";
-      return { status: "error", finalText: finalText || null, totalCostUsd, durationMs: Date.now() - startedAt, errorMessage: `claude exited ${exitCode}: ${stderr.trim().slice(0, 300)}` };
+      // Prefer the result-event reason (model unavailable, rate limit, …); claude
+      // leaves stderr empty for those, so falling back to stderr alone yields a
+      // bare "claude exited 1:" the user can't act on.
+      const detail = (resultError ?? "") || stderr.trim() || "no error detail on stderr";
+      return { status: "error", finalText: finalText || null, totalCostUsd, durationMs: Date.now() - startedAt, errorMessage: `claude exited ${exitCode}: ${detail.slice(0, 300)}` };
     }
     return { status: "done", finalText: finalText || null, totalCostUsd, durationMs: Date.now() - startedAt };
   } catch (e) {

@@ -1,6 +1,7 @@
 import { test, expect, describe } from "bun:test";
 import {
-  buildClaudeArgv, buildGateEnv, makeStreamHandler, runAgentic, type AgenticSpawnLike,
+  buildClaudeArgv, buildGateEnv, makeStreamHandler, runAgentic, isSessionUnusableError,
+  type AgenticSpawnLike,
 } from "./agentic-runner";
 
 describe("buildClaudeArgv", () => {
@@ -112,5 +113,32 @@ describe("runAgentic (fake spawn)", () => {
     const r = await runAgentic({ ...base, spawn: fakeSpawn(["noise"], 2) });
     expect(r.status).toBe("error");
     expect(r.errorMessage).toContain("exited 2");
+  });
+  test("surfaces the result-event reason when stderr is empty (model unavailable)", async () => {
+    // claude reports model-unavailable in the result event, not stderr — exit 1
+    // with blank stderr. The message must carry the real reason, not be empty.
+    const r = await runAgentic({
+      ...base,
+      spawn: fakeSpawn([
+        '{"type":"system","subtype":"init"}',
+        '{"type":"result","subtype":"success","is_error":true,"result":"Claude Fable 5 is currently unavailable."}',
+      ], 1),
+    });
+    expect(r.status).toBe("error");
+    expect(r.errorMessage).toContain("exited 1");
+    expect(r.errorMessage).toContain("Claude Fable 5 is currently unavailable");
+  });
+});
+
+describe("isSessionUnusableError", () => {
+  test("matches a dead conversation and an unavailable pinned model", () => {
+    expect(isSessionUnusableError("claude exited 1: No conversation found for session abc")).toBe(true);
+    expect(isSessionUnusableError("claude exited 1: Claude Fable 5 is currently unavailable.")).toBe(true);
+    expect(isSessionUnusableError("claude exited 1: model claude-fable-5 not found")).toBe(true);
+  });
+  test("does NOT match ordinary task failures (those should surface, not self-heal)", () => {
+    expect(isSessionUnusableError("claude exited 1: TypeError: cannot read x")).toBe(false);
+    expect(isSessionUnusableError(undefined)).toBe(false);
+    expect(isSessionUnusableError("")).toBe(false);
   });
 });

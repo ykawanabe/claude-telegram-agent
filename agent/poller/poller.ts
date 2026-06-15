@@ -57,7 +57,7 @@ import { tasksJson, taskRunDir } from "../lib/paths";
 // Agentic 秘書 mode — gated executor + approval round-trip. The engine (policy,
 // approval store, gate hook, runner) lives under ./agentic; the poller wires the
 // Telegram surface (cards, buttons, /do, proactive routing) here.
-import { runAgentic, defaultHookScriptPath } from "./agentic/agentic-runner";
+import { runAgentic, defaultHookScriptPath, isSessionUnusableError } from "./agentic/agentic-runner";
 import {
   listRequests, readRequest, writeDecision, markSent, cleanup as cleanupApproval,
   type ApprovalRequest,
@@ -2515,7 +2515,7 @@ async function launchAgentic(threadId: string, chatId: number, task: string, des
     let streamedAny = false;
     const buf: string[] = [];
     try {
-      const result = await runAgentic({
+      const doRun = (uuid: string, resume: boolean) => runAgentic({
         mountPath,
         threadId,
         chatId,
@@ -2525,19 +2525,29 @@ async function launchAgentic(threadId: string, chatId: number, task: string, des
         systemPrompt: runOpts?.systemPrompt,
         approvalsDir: APPROVALS_DIR,
         settingsPath: AGENTIC_SETTINGS_FILE,
-        sessionUuid,
-        resumeExisting,
+        sessionUuid: uuid,
+        resumeExisting: resume,
         logFile: join(AGENTIC_LOG_DIR, `${sessionKey}.jsonl`),
         // Conditional → buffer (decide at end). Normal → stream live.
         onText: (t) => { streamedAny = true; if (notifyOnlyIf) buf.push(t); else void reply(dest, t); },
       });
-      process.stdout.write(`[${new Date().toISOString()}] agentic result: thread=${threadId} status=${result.status} model=${model ?? "default"} effort=${effort ?? "default"} cost=$${result.totalCostUsd.toFixed(4)} dur=${result.durationMs}ms\n`);
-      // Self-heal: a --resume that hit a dead session (e.g. the mount's cwd
-      // changed) → drop the session pointer so the next run recreates it fresh.
-      if (result.status === "error" && resumeExisting
-          && (result.errorMessage ?? "").includes("No conversation found")) {
+      let result = await doRun(sessionUuid, resumeExisting);
+      // Self-heal: a --resume can hit an unusable session — the conversation was
+      // deleted (mount cwd changed), or it's pinned to a model that's since gone
+      // unavailable (e.g. an access-gated model). claude exits 1 every cycle and a
+      // scheduled task would fail forever. Drop the pointer and retry ONCE on a
+      // fresh session so it recovers silently — no scary error at startup. Only
+      // safe because such errors die before streaming any output (streamedAny
+      // stays false; buf empty), so the retry can't duplicate user-visible text.
+      if (result.status === "error" && resumeExisting && !streamedAny
+          && isSessionUnusableError(result.errorMessage)) {
+        process.stdout.write(`[${new Date().toISOString()}] agentic self-heal: session=${sessionKey} unusable (${result.errorMessage}) — recreating fresh\n`);
         try { unlinkSync(join(AGENTIC_SESSIONS_DIR, sessionKey)); } catch { /* gone */ }
+        const freshUuid = randomUUID();
+        try { writeFileSync(join(AGENTIC_SESSIONS_DIR, sessionKey), freshUuid + "\n", { mode: 0o600 }); } catch { /* continue */ }
+        result = await doRun(freshUuid, false);
       }
+      process.stdout.write(`[${new Date().toISOString()}] agentic result: thread=${threadId} status=${result.status} model=${model ?? "default"} effort=${effort ?? "default"} cost=$${result.totalCostUsd.toFixed(4)} dur=${result.durationMs}ms\n`);
       let suppressed = false;
       if (result.status === "error") {
         await reply(dest, `⚠️ Agentic run failed: ${result.errorMessage ?? "unknown error"}`);
