@@ -88,6 +88,10 @@ export class ClaudeDaemon extends EventEmitter {
     });
     this.proc = proc;
     this.alive = true;
+    const started = new Promise<void>((resolve, reject) => {
+      proc.once("spawn", resolve);
+      proc.once("error", reject);
+    });
 
     proc.stdout!.setEncoding("utf8");
     proc.stdout!.on("data", (chunk: string) => this.onStdout(chunk));
@@ -97,9 +101,12 @@ export class ClaudeDaemon extends EventEmitter {
       // Surface as a log-level event; callers decide whether to log.
       this.emit("stderr", chunk);
     });
-    proc.on("error", (err) => {
+    proc.on("error", () => {
       this.alive = false;
-      this.emit("error", err);
+      // `error` is a special EventEmitter event which throws when nobody is
+      // listening. start() owns spawn failures through `started`; later child
+      // failures are followed by `close`, which emits the registry's crash
+      // signal below.
     });
     proc.on("close", (code, signal) => {
       this.alive = false;
@@ -108,6 +115,14 @@ export class ClaudeDaemon extends EventEmitter {
       // 'crash' handler decides whether to respawn.
       this.emit("crash", { code, signal });
     });
+
+    try {
+      await started;
+    } catch (error) {
+      this.alive = false;
+      this.proc = null;
+      throw error;
+    }
 
     // Tiny delay so the subprocess has a moment to wire its stdio. Without
     // this, the first send() can race the child's stdin reader setup on

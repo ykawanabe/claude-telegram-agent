@@ -89,6 +89,16 @@ describe("TelegramOutboundSender", () => {
       retryable: true,
       telegramErrorCode: 503,
     });
+
+    const malformed = senderWith(new Response("null", {
+      status: 503,
+      headers: { "Content-Type": "application/json" },
+    }));
+    await expect(malformed.send(textMessage)).rejects.toMatchObject({
+      kind: "server_error",
+      retryable: true,
+      httpStatus: 503,
+    });
   });
 
   test("classifies non-rate-limit 4xx as permanent", async () => {
@@ -112,6 +122,70 @@ describe("TelegramOutboundSender", () => {
 
     const missing = senderWith(Response.json({ ok: true, result: {} }));
     await expect(missing.send(textMessage)).rejects.toMatchObject({ kind: "uncertain", retryable: false });
+  });
+
+  test("keeps the timeout active while reading the response body and cancels it", async () => {
+    let cancelled = false;
+    let closeTimer: ReturnType<typeof setTimeout> | undefined;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        closeTimer = setTimeout(() => controller.close(), 100);
+      },
+      cancel() {
+        cancelled = true;
+        if (closeTimer) clearTimeout(closeTimer);
+      },
+    });
+    const sender = new TelegramOutboundSender({
+      apiBase: "http://telegram.test/botfake",
+      timeoutMs: 5,
+      fetch: (async () => new Response(body, { status: 200 })) as typeof fetch,
+    });
+
+    const outcome = await Promise.race([
+      sender.send(textMessage).then(
+        () => ({ kind: "delivered" }),
+        (error: unknown) => error,
+      ),
+      new Promise((resolve) => setTimeout(() => resolve({ kind: "hung" }), 50)),
+    ]);
+
+    expect(outcome).toMatchObject({ kind: "uncertain", retryable: false });
+    expect(cancelled).toBe(true);
+  });
+
+  test("bounds and cancels oversized Telegram response bodies", async () => {
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`{"ok":true,"padding":"${"x".repeat(128)}`));
+      },
+      cancel() { cancelled = true; },
+    });
+    const sender = new TelegramOutboundSender({
+      apiBase: "http://telegram.test/botfake",
+      maxResponseBytes: 64,
+      fetch: (async () => new Response(body, { status: 200 })) as typeof fetch,
+    });
+
+    await expect(sender.send(textMessage)).rejects.toMatchObject({ kind: "uncertain", retryable: false });
+    expect(cancelled).toBe(true);
+  });
+
+  test("propagates caller cancellation into the fetch signal", async () => {
+    const external = new AbortController();
+    const sender = new TelegramOutboundSender({
+      apiBase: "http://telegram.test/botfake",
+      timeoutMs: 5_000,
+      fetch: (async (_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("aborted by caller")), { once: true });
+      })) as typeof fetch,
+    });
+
+    const pending = sender.send(textMessage, external.signal);
+    external.abort();
+
+    await expect(pending).rejects.toMatchObject({ kind: "uncertain", retryable: false });
   });
 
   test("keeps missing credentials permanent instead of rewrapping them as uncertain", async () => {

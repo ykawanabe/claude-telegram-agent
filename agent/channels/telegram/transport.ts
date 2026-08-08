@@ -53,6 +53,7 @@ import type {
   RoutingKey,
   SenderId,
   InboundEvent,
+  InboundHandlerResult,
   InboundJournal,
   OutboundButton,
   AckHandle,
@@ -196,7 +197,7 @@ export class TelegramTransport
   })();
   private readonly outboundSender = new TelegramOutboundSender();
 
-  private handler: ((e: InboundEvent) => Promise<void>) | null = null;
+  private handler: ((e: InboundEvent) => Promise<InboundHandlerResult>) | null = null;
   private running = false;
   // The AbortController for the *current* getUpdates iteration. Created fresh
   // per long-poll, cleared on iteration end. interruptInbound() flips this so
@@ -206,7 +207,7 @@ export class TelegramTransport
 
   // ─── required core ─────────────────────────────────────────────────────────
 
-  onEvent(handler: (e: InboundEvent) => Promise<void>): void {
+  onEvent(handler: (e: InboundEvent) => Promise<InboundHandlerResult>): void {
     this.handler = handler;
   }
 
@@ -333,7 +334,17 @@ export class TelegramTransport
     // leaving the first durable record untouched for comparison.
     try {
       const ev = normalizeUpdate(update);
-      if (ev && this.handler) await this.handler(ev);
+      const result = ev && this.handler ? await this.handler(ev) : undefined;
+      if (result) {
+        // Shadow intentionally leaves the original durable record untouched,
+        // but a deferred daemon receipt must still have a rejection consumer.
+        // Otherwise a later crash/reset becomes an unhandled rejection.
+        void result.completion.catch((error) => {
+          process.stderr.write(
+            `[${new Date().toISOString()}] shadow inbound deferred outcome unknown (update ${update.update_id}): ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
+          );
+        });
+      }
     } catch (e) {
       // Poison updates are explicitly discarded after logging; transient process
       // death leaves the record on disk and it is replayed on the next start.
@@ -362,21 +373,63 @@ export class TelegramTransport
     }
 
     this.inboundJournal.markDispatched(messageId, claimToken);
+    let deferred = false;
     try {
-      if (event && this.handler) await this.handler(event);
+      const result = event && this.handler ? await this.handler(event) : undefined;
+      if (result) {
+        deferred = true;
+        // Shadow's legacy inbox retains pre-handler crash replay only. Once the
+        // downstream queue accepted a receipt, replaying this file after a
+        // mid-turn crash would duplicate an outcome the durable journal marks
+        // uncertain. Enforced never created a legacy file; removal is harmless.
+        this.legacyInboundInbox.remove(update.update_id);
+        void this.settleDeferredInbound(update, messageId, claimToken, result.completion);
+        return;
+      }
       this.inboundJournal.complete(messageId, claimToken);
     } catch (error) {
+      this.markInboundOutcomeUnknown(update, messageId, claimToken, error);
+    } finally {
+      if (!deferred) this.legacyInboundInbox.remove(update.update_id);
+    }
+  }
+
+  private async settleDeferredInbound(
+    update: TgUpdate,
+    messageId: string,
+    claimToken: string,
+    completion: Promise<void>,
+  ): Promise<void> {
+    try {
+      await completion;
+      this.inboundJournal.complete(messageId, claimToken);
+    } catch (error) {
+      this.markInboundOutcomeUnknown(update, messageId, claimToken, error);
+    } finally {
+      this.legacyInboundInbox.remove(update.update_id);
+    }
+  }
+
+  private markInboundOutcomeUnknown(
+    update: TgUpdate,
+    messageId: string,
+    claimToken: string,
+    error: unknown,
+  ): void {
+    try {
       this.inboundJournal.markOutcomeUnknown(
         messageId,
         claimToken,
         `handler result unknown: ${error instanceof Error ? error.message : String(error)}`,
       );
+    } catch (journalError) {
       process.stderr.write(
-        `[${new Date().toISOString()}] inbound dispatch outcome unknown (update ${update.update_id}): ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
+        `[${new Date().toISOString()}] inbound outcome-unknown persistence failed (update ${update.update_id}): ${journalError instanceof Error ? (journalError.stack ?? journalError.message) : String(journalError)}\n`,
       );
-    } finally {
-      this.legacyInboundInbox.remove(update.update_id);
     }
+    process.stderr.write(
+      `[${new Date().toISOString()}] inbound dispatch outcome unknown (update ${update.update_id}): ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
+    );
   }
 
   /** Queue gauges used by the reliability sampler without exposing payloads. */

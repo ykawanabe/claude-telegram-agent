@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { FileOutboxStore } from "./store";
+import { FileOutboxStore, type FileOutboxStoreOptions } from "./store";
 import { PersistentOutbox } from "./outbox";
 import {
   OUTBOX_SCHEMA_VERSION,
@@ -15,10 +15,10 @@ import {
 
 const roots: string[] = [];
 
-function store(name: string): FileOutboxStore {
+function store(name: string, options?: FileOutboxStoreOptions): FileOutboxStore {
   const root = join(tmpdir(), `cta-outbox-${name}-${process.pid}-${Math.random().toString(16).slice(2)}`);
   roots.push(root);
-  return new FileOutboxStore(root);
+  return new FileOutboxStore(root, options);
 }
 
 const message = {
@@ -56,6 +56,115 @@ describe("PersistentOutbox", () => {
     expect(result.messageRef).toEqual({ channel: "telegram", chatId: -100, messageId: 9876 });
     expect(s.listPending()).toHaveLength(0);
     expect(s.listCompleted()[0].result).toEqual(result.messageRef);
+  });
+
+  test("round-trips structured buttons accepted by OutboundMessage", async () => {
+    const s = store("structured-buttons");
+    const outbox = new PersistentOutbox({
+      store: s,
+      mode: "enforced",
+      sender: { async send() { return { channel: "telegram", chatId: -100, messageId: 1 }; } },
+    });
+    const buttonMessage = {
+      kind: "buttons" as const,
+      to: { channel: "telegram" as const, chatId: -100, threadId: 42 },
+      text: "Choose",
+      buttons: [{ label: "Approve", action: "apv:req-1:allow" }],
+    };
+
+    await outbox.enqueue(buttonMessage, { id: "structured-buttons", dispatchNow: false });
+
+    const reopened = new FileOutboxStore(s.rootDir);
+    expect(reopened.get("structured-buttons")?.message).toEqual(buttonMessage);
+  });
+
+  test("rejects a full pending queue before any network side effect", async () => {
+    const s = store("queue-capacity", { maxPendingRecords: 1 });
+    let sends = 0;
+    const outbox = new PersistentOutbox({
+      store: s,
+      mode: "enforced",
+      sender: { async send() { sends += 1; return { channel: "telegram", chatId: -100, messageId: 1 }; } },
+    });
+    await outbox.enqueue(message, { id: "first", dispatchNow: false });
+
+    await expect(outbox.enqueue(message, { id: "second" })).rejects.toThrow("pending capacity");
+    expect(sends).toBe(0);
+    expect(s.listPending().map((record) => record.id)).toEqual(["first"]);
+  });
+
+  test("rejects oversized records before any network side effect", async () => {
+    const s = store("record-capacity", { maxRecordBytes: 512 });
+    let sends = 0;
+    const outbox = new PersistentOutbox({
+      store: s,
+      mode: "enforced",
+      sender: { async send() { sends += 1; return { channel: "telegram", chatId: -100, messageId: 1 }; } },
+    });
+
+    await expect(outbox.enqueue({ ...message, text: "x".repeat(1_024) }, { id: "too-large" }))
+      .rejects.toThrow("record exceeds");
+    expect(sends).toBe(0);
+    expect(s.get("too-large")).toBeNull();
+  });
+
+  test("writes 0600 records via a cleaned-up temporary file", async () => {
+    const s = store("permissions");
+    const outbox = new PersistentOutbox({
+      store: s,
+      mode: "enforced",
+      sender: { async send() { return { channel: "telegram", chatId: -100, messageId: 1 }; } },
+    });
+
+    await outbox.enqueue(message, { id: "private", dispatchNow: false });
+
+    const pendingDir = join(s.rootDir, "pending");
+    expect(statSync(join(pendingDir, "private.json")).mode & 0o777).toBe(0o600);
+    expect(readdirSync(pendingDir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+  });
+
+  test("bounds terminal, corrupt, and orphan-temp files without pruning pending work", async () => {
+    const limits: FileOutboxStoreOptions = {
+      maxCompletedRecords: 1,
+      maxDeadLetterRecords: 1,
+      maxCorruptRecords: 1,
+    };
+    const s = store("retention", limits);
+    let messageId = 0;
+    const delivered = new PersistentOutbox({
+      store: s,
+      mode: "enforced",
+      sender: { async send() { return { channel: "telegram", chatId: -100, messageId: ++messageId }; } },
+    });
+    await delivered.enqueue(message, { id: "completed-a" });
+    await delivered.enqueue(message, { id: "completed-z" });
+    expect(s.listCompleted().map((record) => record.id)).toEqual(["completed-z"]);
+
+    const rejected = new PersistentOutbox({
+      store: s,
+      mode: "enforced",
+      sender: {
+        async send() {
+          throw new OutboundSendError({ kind: "permanent", message: "rejected" });
+        },
+      },
+    });
+    await rejected.enqueue(message, { id: "dead-a" });
+    await rejected.enqueue(message, { id: "dead-z" });
+    expect(s.listDeadLetters().map((record) => record.id)).toEqual(["dead-z"]);
+
+    writeFileSync(join(s.rootDir, "pending", "broken-a.json"), "{broken", { mode: 0o600 });
+    writeFileSync(join(s.rootDir, "pending", "broken-z.json"), "{broken", { mode: 0o600 });
+    s.listPending();
+    const corruptNames = readdirSync(join(s.rootDir, "corrupt"));
+    expect(corruptNames.filter((name) => name.endsWith(".corrupt"))).toHaveLength(1);
+    expect(corruptNames.filter((name) => name.endsWith(".corrupt.reason"))).toHaveLength(1);
+
+    const pendingDir = join(s.rootDir, "pending");
+    writeFileSync(join(pendingDir, ".orphan.123.tmp"), "partial", { mode: 0o600 });
+    const reopened = new FileOutboxStore(s.rootDir, limits);
+    expect(existsSync(join(pendingDir, ".orphan.123.tmp"))).toBe(false);
+    expect(reopened.listPending()).toEqual([]);
   });
 
   test("deduplicates a completed application message across store instances", async () => {
@@ -240,6 +349,8 @@ describe("outbox fault recovery", () => {
   test("quarantines corrupt pending state without blocking healthy work", async () => {
     const s = store("corrupt");
     writeFileSync(join(s.rootDir, "pending", "broken.json"), "{not-json", { mode: 0o600 });
+    const maximumId = "x".repeat(200);
+    writeFileSync(join(s.rootDir, "pending", `${maximumId}.json`), "{not-json", { mode: 0o600 });
     const record: OutboxRecord = {
       schemaVersion: OUTBOX_SCHEMA_VERSION,
       id: "healthy",
@@ -254,7 +365,9 @@ describe("outbox fault recovery", () => {
 
     expect(s.listPending().map((r) => r.id)).toEqual(["healthy"]);
     expect(existsSync(join(s.rootDir, "pending", "broken.json"))).toBe(false);
+    expect(existsSync(join(s.rootDir, "pending", `${maximumId}.json`))).toBe(false);
     expect(readdirSync(join(s.rootDir, "corrupt")).some((name) => name.startsWith("broken.json."))).toBe(true);
+    expect(readdirSync(join(s.rootDir, "corrupt")).filter((name) => name.endsWith(".corrupt"))).toHaveLength(2);
   });
 
   test("disk-full persistence failure prevents the network side effect", async () => {

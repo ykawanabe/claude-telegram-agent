@@ -30,6 +30,8 @@ CTA_FAULT_PLAN='[
 ```
 
 Reliability policy defaults to `CTA_RELIABILITY_MODE=shadow`. Shadow emits the
-same comparisons as enforced mode but never blocks. After the configured number
-of healthy evaluation windows reports `promotionReady: true`, restart with
-`CTA_RELIABILITY_MODE=enforced` to apply those comparisons as gates.
+same comparisons as enforced mode but never blocks. Empty or undersampled
+snapshots emit `missingEvidence`, reset the consecutive-healthy counter, and
+cannot report `promotionReady`. Do not enable enforced mode unless real shadow
+traffic has supplied the configured minimum samples and the required number of
+healthy windows. Enforced `assertHealthy()` fails closed on missing evidence.

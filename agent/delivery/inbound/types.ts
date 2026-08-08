@@ -132,6 +132,15 @@ export interface RecoveryResult<Payload> {
 export interface InboundJournalSummary {
   mode: InboundJournalMode;
   states: Record<InboundDeliveryState, number>;
+  /** Valid and corrupt record files currently retained in records/. */
+  storedRecords: number;
+  /** received + claimed + dispatched + uncertain; bounded for recovery. */
+  activeRecords: number;
+  maxRecords: number;
+  maxReplayBatch: number;
+  quarantineRecords: number;
+  maxQuarantineRecords: number;
+  maxRecordBytes: number;
   duplicateObservations: number;
   shadowWouldSuppress: number;
   shadowWouldHold: number;

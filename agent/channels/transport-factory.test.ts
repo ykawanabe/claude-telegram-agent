@@ -18,7 +18,8 @@ process.env.TELEGRAM_BOT_TOKEN = "fake";
 
 import { makeOutboundQueue, makeTransport } from "./transport-factory";
 import { TelegramTransport } from "./telegram/transport";
-import type { ChatTransport, MessageRef } from "./types";
+import type { ButtonCapable, ChatTransport, MessageRef } from "./types";
+import { FileOutboxStore, OutboundSendError } from "../delivery/outbound";
 
 describe("makeTransport", () => {
   test('"telegram" → TelegramTransport', () => {
@@ -128,5 +129,83 @@ describe("makeOutboundQueue", () => {
     });
     expect(second).toEqual(first);
     expect(sends).toBe(1);
+  });
+
+  test("persists structured inline buttons instead of taking the shadow fallback", async () => {
+    const rootDir = join(STATE, `buttons-${Date.now()}-${Math.random()}`);
+    let sends = 0;
+    const transport: ChatTransport & ButtonCapable = {
+      channel: "telegram",
+      transportVersion: 1,
+      capabilities: new TelegramTransport().capabilities,
+      async start() {},
+      async stop() {},
+      onEvent() {},
+      async whoami() { return { id: "1" }; },
+      async sendText() { throw new Error("button path must not degrade to text"); },
+      async sendButtons({ to }) {
+        sends += 1;
+        return { channel: "telegram", chatId: to.chatId, messageId: 800 + sends };
+      },
+      mountCacheKey() { return "telegram:dm"; },
+      routingKey() { return "dm" as never; },
+    };
+    const queue = makeOutboundQueue(transport, { mode: "shadow", rootDir });
+
+    const result = await queue.enqueueTracked({
+      kind: "buttons",
+      to: { channel: "telegram", chatId: 1 },
+      text: "Choose:",
+      buttons: [{ label: "A", action: "act:A" }],
+    });
+    await queue.stop();
+
+    expect(result.status).toBe("delivered");
+    expect(sends).toBe(1);
+    const completed = new FileOutboxStore(rootDir).listCompleted();
+    expect(completed).toHaveLength(1);
+    expect(completed[0].message).toMatchObject({
+      kind: "buttons",
+      buttons: [{ label: "A", action: "act:A" }],
+    });
+  });
+
+  test("carries Telegram 429 classification into the enforced retry schedule", async () => {
+    const rootDir = join(STATE, `rate-limit-${Date.now()}-${Math.random()}`);
+    const transport: ChatTransport = {
+      channel: "telegram",
+      transportVersion: 1,
+      capabilities: new TelegramTransport().capabilities,
+      async start() {},
+      async stop() {},
+      onEvent() {},
+      async whoami() { return { id: "1" }; },
+      async sendText() {
+        throw new OutboundSendError({
+          kind: "rate_limited",
+          message: "Too Many Requests",
+          retryable: true,
+          retryAfterMs: 7_000,
+          httpStatus: 429,
+          telegramErrorCode: 429,
+        });
+      },
+      mountCacheKey() { return "telegram:dm"; },
+      routingKey() { return "dm" as never; },
+    };
+    const queue = makeOutboundQueue(transport, { mode: "enforced", rootDir });
+
+    const result = await queue.enqueueTracked({
+      kind: "text",
+      to: { channel: "telegram", chatId: 1 },
+      text: "retry me",
+    });
+    await queue.stop();
+
+    expect(result.status).toBe("retry_scheduled");
+    expect(new FileOutboxStore(rootDir).listPending()[0]).toMatchObject({
+      state: "retry_wait",
+      failure: { kind: "rate_limited", retryAfterMs: 7_000, httpStatus: 429 },
+    });
   });
 });

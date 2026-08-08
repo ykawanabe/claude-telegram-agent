@@ -8,6 +8,9 @@ export interface DistributionSnapshot {
   p99Ms: number;
 }
 
+export const DEFAULT_MAX_DISTRIBUTION_SAMPLES = 2_048;
+export const DEFAULT_MAX_IN_FLIGHT_TURNS = 4_096;
+
 export interface QueueDepthSnapshot {
   current: number;
   max: number;
@@ -115,10 +118,19 @@ export class ReliabilityMetrics {
   private rssCurrent = 0;
   private rssMax = 0;
   private rssSamples = 0;
+  private readonly maxInFlightTurns: number;
 
-  constructor(private readonly options: { maxDistributionSamples?: number; now?: () => number } = {}) {
-    const capacity = options.maxDistributionSamples ?? 2_048;
+  constructor(private readonly options: {
+    maxDistributionSamples?: number;
+    maxInFlightTurns?: number;
+    now?: () => number;
+  } = {}) {
+    const capacity = options.maxDistributionSamples ?? DEFAULT_MAX_DISTRIBUTION_SAMPLES;
     if (!Number.isSafeInteger(capacity) || capacity <= 0) throw new Error("maxDistributionSamples must be a positive integer");
+    this.maxInFlightTurns = options.maxInFlightTurns ?? DEFAULT_MAX_IN_FLIGHT_TURNS;
+    if (!Number.isSafeInteger(this.maxInFlightTurns) || this.maxInFlightTurns <= 0) {
+      throw new Error("maxInFlightTurns must be a positive integer");
+    }
     this.turnLatency = new BoundedDistribution(capacity);
     this.telegramLatency = new BoundedDistribution(capacity);
   }
@@ -138,6 +150,9 @@ export class ReliabilityMetrics {
     if (!turnId) throw new Error("turnId must not be empty");
     if (this.turnStarts.has(turnId)) throw new Error(`turn already started: ${turnId}`);
     assertNonNegativeFinite("turn start", startedAtMs);
+    if (this.turnStarts.size >= this.maxInFlightTurns) {
+      throw new Error(`in-flight turn tracking capacity exceeded (${this.maxInFlightTurns})`);
+    }
     this.turnStarts.set(turnId, startedAtMs);
     this.turnStartedCount += 1;
   }

@@ -25,6 +25,12 @@ describe("ClaudeDaemon basic lifecycle", () => {
     expect(daemon.isAlive).toBe(true);
   });
 
+  test("start rejects when the executable cannot be spawned", async () => {
+    daemon = new ClaudeDaemon({ claudeBin: "/definitely/missing/claude", cwd: "/tmp" });
+    await expect(daemon.start()).rejects.toThrow();
+    expect(daemon.isAlive).toBe(false);
+  });
+
   test("stop terminates the subprocess; isAlive flips false", async () => {
     daemon = new ClaudeDaemon({ claudeBin: FIXTURE, cwd: "/tmp" });
     await daemon.start();

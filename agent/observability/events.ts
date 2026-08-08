@@ -1,7 +1,23 @@
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import {
+  appendFileSync,
+  chmodSync,
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname } from "node:path";
 
 export const OBSERVABILITY_SCHEMA_VERSION = 1 as const;
+export const DEFAULT_EVENT_LOG_MAX_BYTES = 16 * 1024 * 1024;
+export const DEFAULT_EVENT_LOG_MAX_FILES = 4;
+export const DEFAULT_EVENT_LINE_MAX_BYTES = 256 * 1024;
+export const DEFAULT_MEMORY_EVENT_CAPACITY = 4_096;
 
 export type ReliabilityMode = "shadow" | "enforced";
 
@@ -56,6 +72,12 @@ export interface ObservabilityEventData {
     mode: ReliabilityMode;
     allowed: boolean;
     wouldBlock: boolean;
+    evidenceSufficient: boolean;
+    missingEvidence: Array<{
+      metric: string;
+      actual: number;
+      required: number;
+    }>;
     consecutiveHealthyWindows: number;
     promotionReady: boolean;
     violations: Array<{
@@ -96,10 +118,33 @@ export interface StructuredEventSink {
 }
 
 export class MemoryEventSink implements StructuredEventSink {
-  readonly events: StructuredEvent[] = [];
+  private readonly buffer: StructuredEvent[] = [];
+  private nextIndex = 0;
+  private dropped = 0;
+
+  constructor(readonly capacity = DEFAULT_MEMORY_EVENT_CAPACITY) {
+    assertPositiveInteger("memory event capacity", capacity);
+  }
 
   write(event: StructuredEvent): void {
-    this.events.push(event);
+    if (this.buffer.length < this.capacity) {
+      this.buffer.push(event);
+      return;
+    }
+    this.buffer[this.nextIndex] = event;
+    this.nextIndex = (this.nextIndex + 1) % this.capacity;
+    this.dropped += 1;
+  }
+
+  /** Retained events in emission order. The returned copy is always bounded by
+   * capacity, so consumers cannot mutate the sink's ring buffer. */
+  get events(): StructuredEvent[] {
+    if (this.buffer.length < this.capacity || this.nextIndex === 0) return [...this.buffer];
+    return [...this.buffer.slice(this.nextIndex), ...this.buffer.slice(0, this.nextIndex)];
+  }
+
+  diagnostics(): { retained: number; dropped: number; capacity: number } {
+    return { retained: this.buffer.length, dropped: this.dropped, capacity: this.capacity };
   }
 }
 
@@ -123,17 +168,92 @@ export class CompositeEventSink implements StructuredEventSink {
 
 export class JsonlEventSink implements StructuredEventSink {
   private initialized = false;
+  readonly maxBytes: number;
+  readonly maxFiles: number;
+  readonly maxEventBytes: number;
 
-  constructor(readonly path: string) {}
+  constructor(
+    readonly path: string,
+    options: {
+      maxBytes?: number;
+      /** Total files including the active path. */
+      maxFiles?: number;
+      maxEventBytes?: number;
+    } = {},
+  ) {
+    this.maxBytes = options.maxBytes ?? DEFAULT_EVENT_LOG_MAX_BYTES;
+    this.maxFiles = options.maxFiles ?? DEFAULT_EVENT_LOG_MAX_FILES;
+    this.maxEventBytes = options.maxEventBytes ?? Math.min(DEFAULT_EVENT_LINE_MAX_BYTES, this.maxBytes);
+    assertPositiveInteger("event log maxBytes", this.maxBytes);
+    assertPositiveInteger("event log maxFiles", this.maxFiles);
+    assertPositiveInteger("event log maxEventBytes", this.maxEventBytes);
+    if (this.maxEventBytes > this.maxBytes) throw new Error("event log maxEventBytes must not exceed maxBytes");
+  }
 
   write(event: StructuredEvent): void {
     // Lazy initialization keeps mkdir failures (including ENOSPC) inside the
     // reporter's non-throwing write boundary.
     if (!this.initialized) {
       mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
+      this.secureAndBoundExisting(this.path);
+      for (let suffix = 1; suffix < this.maxFiles; suffix += 1) {
+        this.secureAndBoundExisting(`${this.path}.${suffix}`);
+      }
       this.initialized = true;
     }
-    appendFileSync(this.path, `${JSON.stringify(event)}\n`, { encoding: "utf8", mode: 0o600 });
+    const line = `${JSON.stringify(event)}\n`;
+    const lineBytes = Buffer.byteLength(line);
+    if (lineBytes > this.maxEventBytes) {
+      throw new Error(`observability event is ${lineBytes} bytes (max ${this.maxEventBytes})`);
+    }
+    const currentBytes = existsSync(this.path) ? statSync(this.path).size : 0;
+    if (currentBytes + lineBytes > this.maxBytes) this.rotate();
+    appendFileSync(this.path, line, { encoding: "utf8", mode: 0o600 });
+  }
+
+  private rotate(): void {
+    if (this.maxFiles === 1) {
+      if (existsSync(this.path)) unlinkSync(this.path);
+      return;
+    }
+    const oldest = `${this.path}.${this.maxFiles - 1}`;
+    if (existsSync(oldest)) unlinkSync(oldest);
+    for (let suffix = this.maxFiles - 2; suffix >= 1; suffix -= 1) {
+      const source = `${this.path}.${suffix}`;
+      if (existsSync(source)) renameSync(source, `${this.path}.${suffix + 1}`);
+    }
+    if (existsSync(this.path)) renameSync(this.path, `${this.path}.1`);
+  }
+
+  /** Migrates a pre-bound legacy file on first write without ever reading more
+   * than maxBytes. A partial oldest line is discarded. */
+  private secureAndBoundExisting(path: string): void {
+    if (!existsSync(path)) return;
+    chmodSync(path, 0o600);
+    const size = statSync(path).size;
+    if (size <= this.maxBytes) return;
+    const descriptor = openSync(path, "r");
+    const bytes = Buffer.allocUnsafe(this.maxBytes);
+    let bytesRead = 0;
+    try {
+      while (bytesRead < this.maxBytes) {
+        const count = readSync(
+          descriptor,
+          bytes,
+          bytesRead,
+          this.maxBytes - bytesRead,
+          size - this.maxBytes + bytesRead,
+        );
+        if (count === 0) break;
+        bytesRead += count;
+      }
+    } finally {
+      closeSync(descriptor);
+    }
+    const retained = bytes.subarray(0, bytesRead);
+    const newline = retained.indexOf(0x0a);
+    const completeLines = newline < 0 ? Buffer.alloc(0) : retained.subarray(newline + 1);
+    writeFileSync(path, completeLines, { mode: 0o600 });
   }
 }
 
@@ -208,12 +328,42 @@ export class StructuredEventReporter {
 export interface ReadEventLogResult {
   events: StructuredEvent[];
   corruptLines: Array<{ line: number; error: string }>;
+  /** Prefix omitted to keep reader memory finite. This may include one partial
+   * line discarded at the tail-read boundary. */
+  truncatedPrefixBytes: number;
 }
 
 /** Reads as much of an append-only log as is valid. A torn final write or a
  * corrupt line is reported separately so prior events remain useful. */
-export function readEventLog(path: string, options: { onCorrupt?: "skip" | "throw" } = {}): ReadEventLogResult {
-  const text = readFileSync(path, "utf8");
+export function readEventLog(
+  path: string,
+  options: { onCorrupt?: "skip" | "throw"; maxBytes?: number } = {},
+): ReadEventLogResult {
+  const maxBytes = options.maxBytes ?? DEFAULT_EVENT_LOG_MAX_BYTES;
+  assertPositiveInteger("event log read maxBytes", maxBytes);
+  const size = statSync(path).size;
+  const readBytes = Math.min(size, maxBytes);
+  const offset = size - readBytes;
+  const bytes = Buffer.allocUnsafe(readBytes);
+  const descriptor = openSync(path, "r");
+  let bytesRead = 0;
+  try {
+    while (bytesRead < readBytes) {
+      const count = readSync(descriptor, bytes, bytesRead, readBytes - bytesRead, offset + bytesRead);
+      if (count === 0) break;
+      bytesRead += count;
+    }
+  } finally {
+    closeSync(descriptor);
+  }
+  let truncatedPrefixBytes = offset;
+  let text = bytes.subarray(0, bytesRead).toString("utf8");
+  if (offset > 0) {
+    const newline = text.indexOf("\n");
+    if (newline < 0) return { events: [], corruptLines: [], truncatedPrefixBytes: size };
+    truncatedPrefixBytes += Buffer.byteLength(text.slice(0, newline + 1));
+    text = text.slice(newline + 1);
+  }
   const events: StructuredEvent[] = [];
   const corruptLines: Array<{ line: number; error: string }> = [];
   const lines = text.split("\n");
@@ -235,7 +385,7 @@ export function readEventLog(path: string, options: { onCorrupt?: "skip" | "thro
       corruptLines.push(detail);
     }
   }
-  return { events, corruptLines };
+  return { events, corruptLines, truncatedPrefixBytes };
 }
 
 function isStructuredEvent(value: unknown): value is StructuredEvent {
@@ -249,4 +399,8 @@ function isStructuredEvent(value: unknown): value is StructuredEvent {
     && typeof candidate.type === "string"
     && candidate.data != null
     && typeof candidate.data === "object";
+}
+
+function assertPositiveInteger(label: string, value: number): void {
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${label} must be a positive integer`);
 }

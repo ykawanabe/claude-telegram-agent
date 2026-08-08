@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { join } from "node:path";
 import {
   FaultInjectedError,
   FaultInjector,
@@ -34,6 +35,18 @@ describe("deterministic fault injection", () => {
     await expect(injector.run("outbox.persist", () => undefined)).rejects.toMatchObject({ code: "ENOSPC" });
     await expect(injector.run("journal.after-claim", () => undefined)).rejects.toBeInstanceOf(FaultInjectedError);
     expect(killed).toEqual(["journal.after-claim"]);
+  });
+
+  test("can terminate a disposable child at a process-kill checkpoint", async () => {
+    const child = Bun.spawn({
+      cmd: [process.execPath, join(import.meta.dir, "fixtures", "fault-kill-child.ts")],
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    const exitCode = await child.exited;
+    expect(exitCode).not.toBe(0);
+    expect(child.signalCode).toBe("SIGKILL");
   });
 
   test("corrupts serialized state deterministically and emits fault events", () => {

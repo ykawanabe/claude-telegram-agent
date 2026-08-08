@@ -76,4 +76,37 @@ describe("reliability monitor integration", () => {
     });
     expect(memory.events.map((event) => event.type)).toEqual(["queue.depth", "telegram.request", "process.rss"]);
   });
+
+  test("closes active turns on daemon crash and spawn failure", () => {
+    let now = 100;
+    const memory = new MemoryEventSink();
+    const monitor = new ReliabilityMonitor({
+      reporter: new StructuredEventReporter({ source: "test", sink: memory, now: () => now }),
+      now: () => now,
+    });
+    const sink = createObservedDaemonEventSink(monitor);
+
+    sink.emit({ kind: "turn-start", threadId: "crash-thread" });
+    now = 250;
+    sink.emit({ kind: "crash", threadId: "crash-thread", crashCount: 1, code: null, signal: "SIGKILL" });
+    sink.emit({ kind: "turn-start", threadId: "spawn-thread" });
+    now = 400;
+    sink.emit({ kind: "spawn-failed", threadId: "spawn-thread" });
+
+    expect(monitor.snapshot().turns).toMatchObject({
+      started: 2,
+      finished: 2,
+      inFlight: 0,
+      outcomes: { completed: 0, timeout: 0, failed: 2, uncertain: 0 },
+      latency: { count: 2, minMs: 150, maxMs: 150 },
+    });
+    expect(memory.events.map((event) => event.type)).toEqual([
+      "turn.started",
+      "process.crash",
+      "turn.finished",
+      "turn.started",
+      "process.spawn",
+      "turn.finished",
+    ]);
+  });
 });

@@ -85,7 +85,7 @@ import type {
   TgChatMemberUpdated,
 } from "../channels/telegram/adapter";
 import { makeOutboundQueue, makeTransport } from "../channels/transport-factory";
-import { isButtonCapable, isEditable, isInterruptible, isReactable, isTyping, type AckHandle, type ChatAddress, type ChatTransport, type Channel, type InboundEvent } from "../channels/types";
+import { isButtonCapable, isEditable, isInterruptible, isReactable, isTyping, type ChatAddress, type ChatTransport, type Channel, type InboundEvent, type InboundHandlerResult } from "../channels/types";
 import type { OutboxEvent } from "../delivery/outbound";
 import {
   JsonlEventSink,
@@ -522,25 +522,6 @@ function isAuthorizedInbound(ev: InboundMessageEvent | ButtonPressEvent): boolea
 // (Typing is likewise transport-owned now — TypingIndicating.startTyping at
 // dispatch + clearTypingExternal at turn-end.)
 
-/** Per-topic queue of ack handles awaiting the "read" flip. Drained on onFlush. */
-const pendingReadAcks: Map<string, AckHandle[]> = new Map();
-
-function trackPendingRead(threadIdStr: string, handle: AckHandle): void {
-  let list = pendingReadAcks.get(threadIdStr);
-  if (!list) { list = []; pendingReadAcks.set(threadIdStr, list); }
-  list.push(handle);
-}
-
-/** Registry onFlush hook: the batch just got written to claude's stdin, so every
- *  queued message in this turn is now "read" by the LLM. One flush → many handles
- *  flipped to 👌 at once (N:1). */
-function onDaemonFlush(threadIdStr: string, _combinedText: string): void {
-  const list = pendingReadAcks.get(threadIdStr);
-  if (!list || list.length === 0) return;
-  pendingReadAcks.delete(threadIdStr);
-  if (isReactable(transport)) void transport.setReadAcks(list);
-}
-
 // ─── topic name cache ────────────────────────────────────────────────────────
 // Bot API has no getForumTopic / getForumTopicByID, so the only way to learn
 // a forum topic's user-set name is to observe forum_topic_created or
@@ -963,7 +944,6 @@ const daemonEventSink: EventSink = {
         postTelegramTextFromDaemon(event.threadId, event.text);
         return;
       case "flush":
-        onDaemonFlush(event.threadId, event.combinedText);
         return;
       case "turn-start":
         onDaemonTurnStart(event.threadId);
@@ -1022,10 +1002,10 @@ function initDaemonRegistry(): void {
 /**
  * Phase 4 dispatch: hand the message to the registry. Registry handles
  * spawn-if-needed, debounce, per-topic queue, turn streaming, and crash
- * recovery. Fire-and-forget — replies flow back via the onText callback,
- * not via this function's return value.
+ * recovery. Replies still flow via onText, while the returned receipt keeps the
+ * inbound journal at dispatched until Claude reports a real turn-end.
  */
-async function daemonDispatch(threadIdStr: string, ev: InboundMessageEvent): Promise<void> {
+async function daemonDispatch(threadIdStr: string, ev: InboundMessageEvent): Promise<InboundHandlerResult> {
   const text = ev.text;
   if (!text) return;
   if (!daemonRegistry) {
@@ -1042,9 +1022,12 @@ async function daemonDispatch(threadIdStr: string, ev: InboundMessageEvent): Pro
   const ack = isReactable(transport)
     ? await transport.setDeliveredAck(ev.messageRef)
     : null;
-  if (ack) trackPendingRead(threadIdStr, ack);
-
-  daemonRegistry!.enqueue(threadIdStr, text);
+  const completion = daemonRegistry!.enqueueWithReceipt(threadIdStr, text, {
+    onAccepted: ack && isReactable(transport)
+      ? () => { void transport.setReadAcks([ack]); }
+      : undefined,
+  });
+  return { completion };
 }
 
 /** Public API for cta / Pager IPC — kill the daemon for a topic so the
@@ -1314,7 +1297,7 @@ export async function handleMyChatMember(mcm: TgChatMemberUpdated): Promise<void
   process.stdout.write(`[${new Date().toISOString()}] pair intro sent: chat=${mcm.chat.id} inviter=${mcm.from.id}${isGroup ? " (group)" : ""}\n`);
 }
 
-export async function onButtonPress(ev: ButtonPressEvent): Promise<void> {
+export async function onButtonPress(ev: ButtonPressEvent): Promise<InboundHandlerResult> {
   // answerCallback (dismiss the tap's spinner) is genuinely Telegram-only — the
   // normalized event doesn't model it, so reach the query id via raw. cb.message
   // (the prompt) likewise survives only on raw: we echo its text + drop its
@@ -1349,7 +1332,7 @@ export async function onButtonPress(ev: ButtonPressEvent): Promise<void> {
     void editMessageText(cb.message.chat.id, cb.message.message_id, `${originalText}\n\n↳ ${label}`);
     // Re-inject the chosen label as the user's next message through the shared
     // normalized pipeline (replaces the old synthetic-TgUpdate → dispatchUpdate).
-    await onInboundMessage({
+    return onInboundMessage({
       kind: "message",
       routingKey: ev.routingKey,
       address: ev.address,
@@ -1358,7 +1341,6 @@ export async function onButtonPress(ev: ButtonPressEvent): Promise<void> {
       messageRef: ev.messageRef,
       raw: ev.raw,
     });
-    return;
   }
 
   // P6a: mount-choice button (`mnt:<thread>:<idx>`) — link the topic to the
@@ -1575,6 +1557,7 @@ async function sweepResources(): Promise<void> {
       if (bytes > IDLE_CLEAR_MIN_BYTES) {
         void idleFlushAndClear(threadIdStr);
       } else {
+        if (!daemonRegistry.isIdleEmpty(threadIdStr)) continue;
         await daemonRegistry.resetTopic(threadIdStr);
         process.stdout.write(`[${new Date().toISOString()}] evicted idle daemon ${threadIdStr} after ${idleEvictMinutes}m (session ${bytes}B ≤ ${IDLE_CLEAR_MIN_BYTES}B)\n`);
       }
@@ -1585,6 +1568,7 @@ async function sweepResources(): Promise<void> {
   // soft cap when every excess daemon is active.
   if (daemonRegistry && MAX_WARM_DAEMONS > 0) {
     for (const threadIdStr of daemonRegistry.overCapacityIdleCandidates(MAX_WARM_DAEMONS)) {
+      if (!daemonRegistry.isIdleEmpty(threadIdStr)) continue;
       await daemonRegistry.resetTopic(threadIdStr);
       process.stdout.write(`[${new Date().toISOString()}] evicted idle daemon ${threadIdStr} to enforce max_warm_daemons=${MAX_WARM_DAEMONS}\n`);
     }
@@ -1779,9 +1763,8 @@ async function handleStop(ev: InboundMessageEvent): Promise<void> {
 
   // The aborted turn emits no turn-end, so onDaemonTurnEnd's clearTypingExternal
   // never fires — clear the typing indicator here so it doesn't keepalive to its
-  // cap. (Read-ack glyphs need no handling: onDaemonFlush already flipped the
-  // in-flight turn's messages to 👌 at flush time; messages queued during the
-  // turn keep their 👀 and flip naturally when the resumed turn flushes.)
+  // cap. (Read-ack glyphs need no handling: each accepted registry prompt has
+  // already flipped to 👌; queued messages keep 👀 until their own stdin write.)
   if (isTyping(transport)) {
     void transport.clearTypingExternal(dest);
   }
@@ -1906,30 +1889,16 @@ async function handlePair(ev: InboundMessageEvent, args: string): Promise<void> 
  * picking up the new paired.json's chat_id. We also kill any leftover
  * `topic-*` tmux sessions from a stale pre-Phase-4 install (defensive). */
 async function resetPerTopicStateOnPairSwitch(): Promise<void> {
-  // Snapshot any in-flight queues before shutdown — otherwise a pair switch
-  // mid-conversation silently drops the user's pending text. Map<threadId, []>
-  // captures every non-empty queue across topics; we replay each into the
-  // fresh registry below so respawn picks them up with the new chat_id.
-  const queueSnapshot = new Map<string, string[]>();
   if (daemonRegistry) {
-    for (const [threadId, queue] of daemonRegistry.snapshotQueues()) {
-      if (queue.length > 0) queueSnapshot.set(threadId, queue);
-    }
     // Shut down all daemons — they hold the old chat_id in their MCP env.
     // shutdown() awaits SIGTERM completion so claude releases its session
-    // lock file cleanly before the next message re-spawns it.
+    // lock file cleanly before the next message re-spawns it. Pending/in-flight
+    // old-chat receipts reject to outcome-unknown and are deliberately NOT
+    // replayed into the new chat: topic IDs can collide across groups, and an
+    // untracked replay could leak or duplicate old-chat work.
     await daemonRegistry.shutdown();
+    daemonRegistry = null;
     initDaemonRegistry(); // fresh registry, lazy respawn on next enqueue
-    // Replay snapshotted messages into the new registry. Each enqueue arms
-    // the debounce; the first inbound after pair switch combines with any
-    // recovered text. Order within each topic is preserved.
-    if (daemonRegistry !== null) {
-      for (const [threadId, queue] of queueSnapshot) {
-        for (const text of queue) {
-          (daemonRegistry as ClaudeDaemonRegistry).enqueue(threadId, text);
-        }
-      }
-    }
   }
 }
 
@@ -2424,7 +2393,7 @@ function recordTopicNameFromEvent(
 // onInboundMessage sees only message-kind events. No raw Telegram fields — every
 // field comes from the normalized event (text/address/routingKey/from/messageRef),
 // so a second platform routes through the identical code.
-async function onInboundMessage(ev: InboundMessageEvent): Promise<void> {
+async function onInboundMessage(ev: InboundMessageEvent): Promise<InboundHandlerResult> {
   // Agentic Edit capture: if the user tapped Edit on an approval card, their next
   // plain (non-command) message in that topic is the corrected params. Consume it
   // as the gate decision and stop — don't route it to the daemon. Only the paired
@@ -2492,11 +2461,13 @@ async function onInboundMessage(ev: InboundMessageEvent): Promise<void> {
   // The registry owns spawn-if-needed, 2s debounce, per-topic queue, and
   // crash respawn. Reply text streams back asynchronously via the
   // postTelegramTextFromDaemon callback wired in initDaemonRegistry().
-  // Await through the durable inbound handler boundary. daemonDispatch returns
-  // once the registry has accepted the prompt, so the journal never marks a
-  // message completed while its enqueue is still pending in a detached task.
-  await daemonDispatch(ev.routingKey, ev);
+  // Return the registry receipt through the transport boundary. Polling stays
+  // non-blocking (so follow-up messages can steer), but the durable journal is
+  // completed only after Claude emits turn-end. Crash/kill/send failures leave
+  // the input outcome-unknown instead of silently losing a completed record.
+  const result = await daemonDispatch(ev.routingKey, ev);
   process.stdout.write(`[${new Date().toISOString()}] msg → daemon[${ev.routingKey}] (${text0.length} chars)\n`);
+  return result;
 }
 
 
@@ -3244,11 +3215,9 @@ export async function main(): Promise<void> {
         return;
       }
       case "button-press":
-        await onButtonPress(ev);
-        return;
+        return onButtonPress(ev);
       case "message":
-        await onInboundMessage(ev);
-        return;
+        return onInboundMessage(ev);
     }
   });
   try {

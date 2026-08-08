@@ -1,10 +1,14 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import {
+  chmodSync,
+  existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
   readdirSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -82,6 +86,31 @@ describe("crash recovery", () => {
     expect(again.newlyUncertain).toBe(0);
     expect(again.replayable.map((e) => e.messageId).sort()).toEqual(["claimed", "received"]);
   });
+
+  test("recovers durable claimed/dispatched states after a real child SIGKILL", async () => {
+    for (const stage of ["claimed", "dispatched"] as const) {
+      const dir = root();
+      const child = Bun.spawn([
+        process.execPath,
+        join(import.meta.dir, "journal.kill-fixture.ts"),
+        dir,
+        stage,
+      ], { stdout: "ignore", stderr: "ignore" });
+      expect(await child.exited).not.toBe(0);
+
+      const restarted = journal(dir);
+      const recovery = restarted.recoverAfterCrash();
+      if (stage === "claimed") {
+        expect(recovery.recoveredClaims).toBe(1);
+        expect(recovery.replayable.map((entry) => entry.messageId)).toEqual([stage]);
+      } else {
+        expect(recovery.newlyUncertain).toBe(1);
+        expect(recovery.uncertain.map((entry) => entry.messageId)).toEqual([stage]);
+        expect(restarted.get(stage)?.failure?.semantic).toBe("outcome-unknown");
+      }
+      expect(existsSync(join(dir, ".journal.lock"))).toBe(false);
+    }
+  });
 });
 
 describe("filesystem fault injection", () => {
@@ -137,6 +166,8 @@ describe("filesystem fault injection", () => {
     expect(recovery.losses[0].quarantinePath).toBeDefined();
     expect(readFileSync(recovery.losses[0].quarantinePath!, "utf8")).toBe(original.slice(0, Math.floor(original.length / 2)));
     expect(readdirSync(join(dir, "quarantine"))).toHaveLength(2);
+    expect(statSync(recovery.losses[0].quarantinePath!).mode & 0o777).toBe(0o600);
+    expect(statSync(`${recovery.losses[0].quarantinePath!}.issue.json`).mode & 0o777).toBe(0o600);
 
     // The failure semantic survives another restart; quarantine is not merely
     // a one-shot log line from the process that discovered corruption.
@@ -146,7 +177,7 @@ describe("filesystem fault injection", () => {
     expect(afterAnotherRestart.recoverAfterCrash().losses).toHaveLength(1);
   });
 
-  test("orphan temp files from a mid-write kill are ignored", () => {
+  test("orphan temp files from a mid-write kill are removed during recovery", () => {
     const dir = root();
     const j = journal(dir);
     j.receive({ messageId: "safe", payload: { value: "durable" } });
@@ -155,6 +186,7 @@ describe("filesystem fault injection", () => {
     const recovery = journal(dir).recoverAfterCrash();
     expect(recovery.replayable.map((entry) => entry.messageId)).toEqual(["safe"]);
     expect(recovery.losses).toEqual([]);
+    expect(readdirSync(join(dir, "records")).some((name) => name.includes(".tmp."))).toBe(false);
   });
 
   test("a lock left by a killed process is recovered", () => {
@@ -166,5 +198,79 @@ describe("filesystem fault injection", () => {
     const j = journal(dir);
     expect(j.receive({ messageId: "after-kill", payload: { value: "ok" } }).classification).toBe("new");
     expect(j.get("after-kill")?.state).toBe("received");
+  });
+
+  test("does not steal an old lock from a live PID and times out finitely", () => {
+    const dir = root();
+    const lockDir = join(dir, ".journal.lock");
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(
+      join(lockDir, "owner.json"),
+      JSON.stringify({ pid: process.pid, acquiredAt: "2000-01-01T00:00:00.000Z" }),
+    );
+    const contender = new FileInboundJournal<Payload>({
+      rootDir: dir,
+      mode: "enforced",
+      lockTimeoutMs: 25,
+      staleLockMs: 1,
+    });
+    expect(() => contender.receive({ messageId: "must-time-out", payload: { value: "x" } }))
+      .toThrow("timed out acquiring inbound journal lock");
+    expect(existsSync(lockDir)).toBe(true);
+  });
+
+  test("creates and replaces durable record files with mode 0600", () => {
+    const dir = root();
+    const j = journal(dir);
+    j.receive({ messageId: "private", payload: { value: "secret" } });
+    const path = join(dir, "records", readdirSync(join(dir, "records"))[0]!);
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+
+    chmodSync(path, 0o644);
+    const claim = j.claim("private", "worker");
+    expect(claim.state).toBe("claimed");
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+  });
+
+  test("bounds corrupt quarantine and leaves excess evidence in place", () => {
+    const dir = root();
+    const creator = new FileInboundJournal<Payload>({
+      rootDir: dir,
+      mode: "enforced",
+      maxRecords: 4,
+      maxReplayBatch: 4,
+      maxQuarantineRecords: 1,
+    });
+    creator.receive({ messageId: "corrupt-a", payload: { value: "a" } });
+    creator.receive({ messageId: "corrupt-b", payload: { value: "b" } });
+    for (const name of readdirSync(join(dir, "records"))) {
+      writeFileSync(join(dir, "records", name), "{bad");
+    }
+
+    expect(() => creator.recoverAfterCrash()).toThrow("quarantine capacity 1 is exhausted");
+    expect(readdirSync(join(dir, "quarantine")).filter((name) => name.endsWith(".corrupt")))
+      .toHaveLength(1);
+    expect(readdirSync(join(dir, "records")).filter((name) => name.endsWith(".json")))
+      .toHaveLength(1);
+
+    const shadow = new FileInboundJournal<Payload>({
+      rootDir: dir,
+      mode: "shadow",
+      maxRecords: 4,
+      maxReplayBatch: 4,
+      maxQuarantineRecords: 1,
+    });
+    const corruptAName = `${createHash("sha256").update("corrupt-a").digest("hex")}.json`;
+    const remainingId = existsSync(join(dir, "records", corruptAName))
+      ? "corrupt-a"
+      : "corrupt-b";
+    expect(shadow.receive({ messageId: remainingId, payload: { value: "legacy" } })).toMatchObject({
+      classification: "journal-error",
+      action: "process",
+      wouldEnforce: "fail-closed",
+      journaled: false,
+      failureSemantic: "loss",
+      error: expect.stringContaining("quarantine capacity 1 is exhausted"),
+    });
   });
 });

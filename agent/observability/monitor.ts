@@ -216,6 +216,15 @@ export function createObservedDaemonEventSink(
   downstream?: EventSink,
 ): EventSink {
   const activeTurns = new Map<string, string>();
+  const finishActive = (
+    threadId: string,
+    outcome: "completed" | "timeout" | "failed" | "uncertain",
+  ): void => {
+    const turnId = activeTurns.get(threadId);
+    if (!turnId) return;
+    activeTurns.delete(threadId);
+    monitor.finishTurn(threadId, turnId, outcome);
+  };
   return {
     emit(event: DaemonEvent): void {
       try {
@@ -242,13 +251,18 @@ export function createObservedDaemonEventSink(
               exitCode: event.code,
               signal: event.signal,
             });
+            finishActive(event.threadId, "failed");
             break;
           case "spawn-failed":
             monitor.recordSpawn("claude-daemon", false, event.threadId);
+            finishActive(event.threadId, "failed");
             break;
           case "crash-loop":
             // Each crash is recorded by the `crash` event. crash-loop is an
             // alert threshold, not another crash, so do not double-count it.
+            // Defensively close a turn if an integration emitted crash-loop
+            // without the preceding crash event.
+            finishActive(event.threadId, "failed");
             break;
           default:
             break;

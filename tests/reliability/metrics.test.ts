@@ -70,4 +70,15 @@ describe("reliability metrics", () => {
     expect(latency.averageMs).toBe(4.5);
     expect(latency.p50Ms).toBeGreaterThanOrEqual(7);
   });
+
+  test("bounds unfinished turn correlation state", () => {
+    const metrics = new ReliabilityMetrics({ maxInFlightTurns: 2, now: () => 0 });
+    metrics.startTurn("turn-1");
+    metrics.startTurn("turn-2");
+
+    expect(() => metrics.startTurn("turn-3")).toThrow("in-flight turn tracking capacity exceeded (2)");
+    expect(metrics.snapshot().turns.inFlight).toBe(2);
+    metrics.finishTurn("turn-1", "uncertain");
+    expect(() => metrics.startTurn("turn-3")).not.toThrow();
+  });
 });

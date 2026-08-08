@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -157,5 +157,108 @@ describe("message-ID dedupe and rollout mode", () => {
     expect(inboundJournalModeFromEnv()).toBe("enforced");
     process.env.CTA_INBOUND_JOURNAL_MODE = "enforce";
     expect(() => inboundJournalModeFromEnv()).toThrow("must be shadow or enforced");
+  });
+});
+
+describe("bounded journal capacity and cached summary", () => {
+  test("fails closed at active capacity in enforced mode and falls back observably in shadow", () => {
+    const enforced = new FileInboundJournal<Payload>({
+      rootDir: root(),
+      mode: "enforced",
+      maxRecords: 2,
+      maxReplayBatch: 2,
+    });
+    enforced.receive({ messageId: "one", payload: payload(1) });
+    enforced.receive({ messageId: "two", payload: payload(2) });
+    expect(() => enforced.receive({ messageId: "three", payload: payload(3) }))
+      .toThrow("active record capacity 2 is exhausted");
+
+    const shadow = new FileInboundJournal<Payload>({
+      rootDir: root(),
+      mode: "shadow",
+      maxRecords: 2,
+      maxReplayBatch: 2,
+    });
+    shadow.receive({ messageId: "one", payload: payload(1) });
+    shadow.receive({ messageId: "two", payload: payload(2) });
+    expect(shadow.receive({ messageId: "three", payload: payload(3) })).toMatchObject({
+      classification: "journal-error",
+      action: "process",
+      wouldEnforce: "fail-closed",
+      managed: false,
+      journaled: false,
+      failureSemantic: "loss",
+      error: expect.stringContaining("active record capacity 2 is exhausted"),
+    });
+  });
+
+  test("evicts the oldest completed tombstone to keep total files bounded", () => {
+    const dir = root();
+    const j = new FileInboundJournal<Payload>({
+      rootDir: dir,
+      mode: "enforced",
+      maxRecords: 2,
+      maxReplayBatch: 2,
+    });
+    j.receive({ messageId: "old-completed", payload: payload(1) });
+    const claim = j.claim("old-completed", "worker");
+    j.markDispatched("old-completed", claim.claim!.token);
+    j.complete("old-completed", claim.claim!.token);
+    j.receive({ messageId: "pending", payload: payload(2) });
+
+    expect(j.receive({ messageId: "new", payload: payload(3) }).classification).toBe("new");
+    expect(j.get("old-completed")).toBeUndefined();
+    expect(readdirSync(join(dir, "records")).filter((name) => name.endsWith(".json"))).toHaveLength(2);
+    expect(j.summary()).toMatchObject({
+      storedRecords: 2,
+      activeRecords: 2,
+      maxRecords: 2,
+      maxReplayBatch: 2,
+    });
+  });
+
+  test("bounds record bytes with the same shadow/enforced failure semantics", () => {
+    const oversized = { text: "x".repeat(4_096), updateId: 1 };
+    const enforced = new FileInboundJournal<Payload>({
+      rootDir: root(),
+      mode: "enforced",
+      maxRecordBytes: 512,
+    });
+    expect(() => enforced.receive({ messageId: "large", payload: oversized }))
+      .toThrow("maxRecordBytes is 512");
+
+    const shadow = new FileInboundJournal<Payload>({
+      rootDir: root(),
+      mode: "shadow",
+      maxRecordBytes: 512,
+    });
+    expect(shadow.receive({ messageId: "large", payload: oversized })).toMatchObject({
+      classification: "journal-error",
+      action: "process",
+      wouldEnforce: "fail-closed",
+      journaled: false,
+      failureSemantic: "loss",
+      error: expect.stringContaining("maxRecordBytes is 512"),
+    });
+  });
+
+  test("summary is incrementally maintained instead of re-reading every record", () => {
+    const dir = root();
+    const j = journal(dir);
+    j.receive({ messageId: "cached", payload: payload(1) });
+    expect(j.summary()).toMatchObject({
+      states: { received: 1, claimed: 0, dispatched: 0, completed: 0, uncertain: 0 },
+      storedRecords: 1,
+      activeRecords: 1,
+      corruptRecords: 0,
+    });
+
+    const recordPath = join(dir, "records", readdirSync(join(dir, "records"))[0]!);
+    writeFileSync(recordPath, "{externally-corrupted");
+
+    // The singleton sampler stays O(1) and reports the last journal-owned
+    // state. A fresh process/recovery scan reconciles external disk changes.
+    expect(j.summary()).toMatchObject({ storedRecords: 1, corruptRecords: 0 });
+    expect(journal(dir).summary()).toMatchObject({ storedRecords: 1, corruptRecords: 1 });
   });
 });

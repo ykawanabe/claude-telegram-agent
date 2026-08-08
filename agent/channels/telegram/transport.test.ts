@@ -7,7 +7,7 @@
  * interfaces it advertises (compile-time assignment + runtime type guards).
  */
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -389,7 +389,159 @@ describe("start/onEvent long-poll loop", () => {
     await t.start({});
     expect(t.deliveryQueueDepths()["inbound.uncertain"]).toBe(1);
   });
+
+  test("deferred completion keeps the journal dispatched until downstream turn-end", async () => {
+    process.env.CTA_INBOUND_JOURNAL_MODE = "enforced";
+    const t = new TelegramTransport();
+    let resolveCompletion!: () => void;
+    const completion = new Promise<void>((resolve) => { resolveCompletion = resolve; });
+    t.onEvent(async (e) => {
+      if (e.kind !== "message") return;
+      await t.stop();
+      return { completion };
+    });
+    updateQueue = [{
+      update_id: 270,
+      message: { message_id: 6, from: { id: 99 }, chat: { id: -100 }, text: "wait for turn-end" },
+    }];
+
+    await t.start({});
+    expect(readOnlyInboundState()).toBe("dispatched");
+    resolveCompletion();
+    await waitForInboundState("completed");
+  });
+
+  test("a second update dispatches while the first durable completion is still pending", async () => {
+    process.env.CTA_INBOUND_JOURNAL_MODE = "enforced";
+    const t = new TelegramTransport();
+    let resolveFirst!: () => void;
+    const firstCompletion = new Promise<void>((resolve) => { resolveFirst = resolve; });
+    const seen: string[] = [];
+    t.onEvent(async (e) => {
+      if (e.kind !== "message") return;
+      seen.push(e.text);
+      if (e.text === "first") return { completion: firstCompletion };
+      await t.stop();
+    });
+    updateQueue = [
+      { update_id: 271, message: { message_id: 8, from: { id: 99 }, chat: { id: -100 }, text: "first" } },
+      { update_id: 272, message: { message_id: 9, from: { id: 99 }, chat: { id: -100 }, text: "second" } },
+    ];
+
+    await t.start({});
+    expect(seen).toEqual(["first", "second"]);
+    expect(readInboundStates().sort()).toEqual(["completed", "dispatched"]);
+    resolveFirst();
+    await waitForAllInboundStates("completed", 2);
+  });
+
+  test("rejected deferred completion is persisted as outcome-unknown", async () => {
+    process.env.CTA_INBOUND_JOURNAL_MODE = "enforced";
+    const t = new TelegramTransport();
+    let rejectCompletion!: (error: Error) => void;
+    const completion = new Promise<void>((_resolve, reject) => { rejectCompletion = reject; });
+    t.onEvent(async (e) => {
+      if (e.kind !== "message") return;
+      await t.stop();
+      return { completion };
+    });
+    updateQueue = [{
+      update_id: 280,
+      message: { message_id: 7, from: { id: 99 }, chat: { id: -100 }, text: "crash after handoff" },
+    }];
+
+    await t.start({});
+    expect(readOnlyInboundState()).toBe("dispatched");
+    rejectCompletion(new Error("daemon killed"));
+    await waitForInboundState("uncertain");
+    expect(t.deliveryQueueDepths()["inbound.uncertain"]).toBe(1);
+  });
+
+  test("shadow deferred handoff removes the legacy replay file immediately", async () => {
+    const t = new TelegramTransport();
+    let rejectCompletion!: (error: Error) => void;
+    const completion = new Promise<void>((_resolve, reject) => { rejectCompletion = reject; });
+    t.onEvent(async (e) => {
+      if (e.kind !== "message") return;
+      await t.stop();
+      return { completion };
+    });
+    updateQueue = [{
+      update_id: 290,
+      message: { message_id: 10, from: { id: 99 }, chat: { id: -100 }, text: "shadow handoff" },
+    }];
+
+    await t.start({});
+    expect(readOnlyInboundState()).toBe("dispatched");
+    expect(existsSync(join(STATE, "inbound-inbox", "290.json"))).toBe(false);
+    rejectCompletion(new Error("shadow daemon killed"));
+    await waitForInboundState("uncertain");
+  });
+
+  test("shadow duplicate observes deferred rejection without an unhandled promise", async () => {
+    const t = new TelegramTransport();
+    const unhandled: unknown[] = [];
+    const observeUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", observeUnhandled);
+    let calls = 0;
+    try {
+      t.onEvent(async (e) => {
+        if (e.kind !== "message") return;
+        calls += 1;
+        if (calls === 1) return;
+        await t.stop();
+        return { completion: Promise.reject(new Error("shadow duplicate crash")) };
+      });
+      const duplicate = {
+        update_id: 300,
+        message: { message_id: 11, from: { id: 99 }, chat: { id: -100 }, text: "duplicate shadow" },
+      };
+      updateQueue = [duplicate, duplicate];
+      await t.start({});
+      await Bun.sleep(10);
+      expect(calls).toBe(2);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", observeUnhandled);
+    }
+  });
 });
+
+function readOnlyInboundState(): string | undefined {
+  return readInboundStates()[0];
+}
+
+function readInboundStates(): string[] {
+  const recordsDir = join(STATE, "delivery", "inbound", "records");
+  return readdirSync(recordsDir)
+    .filter((entry) => entry.endsWith(".json"))
+    .map((name) => {
+      const stored = JSON.parse(readFileSync(join(recordsDir, name), "utf8")) as {
+        record?: { state?: string };
+      };
+      return stored.record?.state;
+    })
+    .filter((state): state is string => typeof state === "string");
+}
+
+async function waitForInboundState(expected: string): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    if (readOnlyInboundState() === expected) return;
+    await Bun.sleep(5);
+  }
+  throw new Error(`timed out waiting for inbound state ${expected}; got ${readOnlyInboundState()}`);
+}
+
+async function waitForAllInboundStates(expected: string, count: number): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const states = readInboundStates();
+    if (states.length === count && states.every((state) => state === expected)) return;
+    await Bun.sleep(5);
+  }
+  throw new Error(`timed out waiting for ${count} inbound states ${expected}; got ${readInboundStates()}`);
+}
 
 describe("interruptInbound — wake-event abort", () => {
   test("advertises InboundInterruptible capability", () => {

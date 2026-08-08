@@ -190,6 +190,16 @@ export interface OutboundQueueResult {
   messageRef?: MessageRef;
 }
 
+/** A handler may defer its durable acknowledgement until downstream work has
+ * actually finished. The transport keeps the inbound journal at dispatched
+ * until completion settles, so a process death cannot silently turn an
+ * in-memory handoff into completed delivery. */
+export interface DeferredInboundCompletion {
+  completion: Promise<void>;
+}
+
+export type InboundHandlerResult = void | DeferredInboundCompletion;
+
 // ─── core interface (required) ───────────────────────────────────────────────
 
 /** REQUIRED. Every adapter implements exactly this. */
@@ -208,7 +218,7 @@ export interface ChatTransport {
    *  `transport-degraded` while retrying and `transport-progress` after a
    *  successful read. Before advancing its remote cursor, the adapter MUST
    *  durably persist inbound work so a crash cannot silently drop it. */
-  onEvent(handler: (e: InboundEvent) => Promise<void>): void;
+  onEvent(handler: (e: InboundEvent) => Promise<InboundHandlerResult>): void;
 
   whoami(): Promise<{ id: string; username?: string; displayName?: string }>;
 

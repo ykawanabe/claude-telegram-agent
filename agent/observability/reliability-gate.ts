@@ -3,10 +3,13 @@ import type { ReliabilityMetricsSnapshot } from "./metrics";
 
 export interface ReliabilityThresholds {
   maxQueueDepth?: number;
+  minQueueSamples?: number;
   maxTurnP95Ms?: number;
+  minTurnSamples?: number;
   maxTelegramFailureRate?: number;
   minTelegramSamples?: number;
   maxRssBytes?: number;
+  minRssSamples?: number;
   maxCrashCount?: number;
 }
 
@@ -20,9 +23,17 @@ export interface ReliabilityDecision {
   mode: ReliabilityMode;
   allowed: boolean;
   wouldBlock: boolean;
+  evidenceSufficient: boolean;
+  missingEvidence: ReliabilityEvidenceGap[];
   violations: ReliabilityViolation[];
   consecutiveHealthyWindows: number;
   promotionReady: boolean;
+}
+
+export interface ReliabilityEvidenceGap {
+  metric: string;
+  actual: number;
+  required: number;
 }
 
 export interface ReliabilityGateOptions {
@@ -37,13 +48,18 @@ export class ReliabilityPolicyError extends Error {
   readonly code = "ERELIABILITY";
 
   constructor(readonly decision: ReliabilityDecision) {
-    super(`reliability policy blocked operation: ${decision.violations.map((v) => v.check).join(", ")}`);
+    const reasons = [
+      ...decision.violations.map((violation) => violation.check),
+      ...decision.missingEvidence.map((gap) => `insufficient-${gap.metric}`),
+    ];
+    super(`reliability policy blocked operation: ${reasons.join(", ")}`);
     this.name = "ReliabilityPolicyError";
   }
 }
 
 /** Shadow is the safe default. In shadow, violations are recorded and the
- * operation remains allowed. Enforced applies the identical comparisons. */
+ * operation remains allowed. Enforced applies the identical comparisons and
+ * also fails closed until every configured metric has minimum evidence. */
 export class ReliabilityGate {
   readonly mode: ReliabilityMode;
   private consecutiveHealthyWindows = 0;
@@ -67,16 +83,22 @@ export class ReliabilityGate {
 
   evaluate(snapshot: ReliabilityMetricsSnapshot): ReliabilityDecision {
     const violations = compareSnapshot(snapshot, this.options.thresholds);
-    this.consecutiveHealthyWindows = violations.length === 0 ? this.consecutiveHealthyWindows + 1 : 0;
-    const wouldBlock = violations.length > 0;
+    const missingEvidence = findMissingEvidence(snapshot, this.options.thresholds);
+    const evidenceSufficient = missingEvidence.length === 0;
+    const healthy = violations.length === 0 && evidenceSufficient;
+    this.consecutiveHealthyWindows = healthy ? this.consecutiveHealthyWindows + 1 : 0;
+    const wouldBlock = !healthy;
     const allowed = this.mode === "shadow" || !wouldBlock;
     const decision: ReliabilityDecision = {
       mode: this.mode,
       allowed,
       wouldBlock,
+      evidenceSufficient,
+      missingEvidence,
       violations,
       consecutiveHealthyWindows: this.consecutiveHealthyWindows,
-      promotionReady: this.consecutiveHealthyWindows >= this.healthyWindowsForPromotion,
+      promotionReady: this.mode === "shadow"
+        && this.consecutiveHealthyWindows >= this.healthyWindowsForPromotion,
     };
     this.options.reporter?.emit("reliability.policy_evaluated", decision);
     return decision;
@@ -122,6 +144,33 @@ export function compareSnapshot(
   return violations;
 }
 
+/** Minimum sample counts are evidence gates, not SLO violations. They keep an
+ * idle/empty snapshot from being mislabeled healthy or promotion-ready. */
+export function findMissingEvidence(
+  snapshot: ReliabilityMetricsSnapshot,
+  thresholds: ReliabilityThresholds,
+): ReliabilityEvidenceGap[] {
+  const gaps: ReliabilityEvidenceGap[] = [];
+  if (thresholds.maxQueueDepth != null) {
+    const samples = Object.values(snapshot.queues)
+      .reduce((total, queue) => total + queue.samples, 0);
+    addBelow(gaps, "queue-samples", samples, minimum("minQueueSamples", thresholds.minQueueSamples, 1));
+  }
+  if (thresholds.maxTurnP95Ms != null) {
+    addBelow(gaps, "turn-samples", snapshot.turns.latency.count,
+      minimum("minTurnSamples", thresholds.minTurnSamples, 20));
+  }
+  if (thresholds.maxTelegramFailureRate != null) {
+    addBelow(gaps, "telegram-samples", snapshot.telegram.attempts,
+      minimum("minTelegramSamples", thresholds.minTelegramSamples, 20));
+  }
+  if (thresholds.maxRssBytes != null) {
+    addBelow(gaps, "rss-samples", snapshot.rss.samples,
+      minimum("minRssSamples", thresholds.minRssSamples, 1));
+  }
+  return gaps;
+}
+
 function addAbove(
   violations: ReliabilityViolation[],
   check: string,
@@ -130,4 +179,19 @@ function addAbove(
 ): void {
   if (!Number.isFinite(threshold) || threshold < 0) throw new Error(`${check} threshold must be non-negative`);
   if (actual > threshold) violations.push({ check, actual, threshold });
+}
+
+function addBelow(
+  gaps: ReliabilityEvidenceGap[],
+  metric: string,
+  actual: number,
+  required: number,
+): void {
+  if (actual < required) gaps.push({ metric, actual, required });
+}
+
+function minimum(label: string, value: number | undefined, fallback: number): number {
+  const result = value ?? fallback;
+  if (!Number.isSafeInteger(result) || result <= 0) throw new Error(`${label} must be a positive integer`);
+  return result;
 }
