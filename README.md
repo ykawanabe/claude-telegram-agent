@@ -105,6 +105,24 @@ Send these inside Telegram (in the paired chat, as the paired user):
 | `cta task list` | List proactive scheduled tasks + each one's last-fire status |
 | `cta task add\|template\|run\|on\|off\|rm …` | Create / scaffold / fire-now / toggle / remove a scheduled task — its own time, days (incl. `monthly:<1-31>` / `every:<N>`), and topic. Runs through the same safety gate (read-only + drafts unattended); `--notify-only-if <marker>` keeps quiet days silent. Also in the Pager app's Tasks tab |
 
+### Delivery reliability rollout
+
+Inbound journaling, the outbound outbox, and reliability policy all start in
+`shadow` mode. Shadow persists state and records the decision enforced mode
+would make, while preserving the existing one-attempt behavior. Inspect
+`~/.pager/observability/events.jsonl`; after stable healthy windows, promote the
+two delivery paths independently in `~/.pager/.env` and restart:
+
+```sh
+CTA_INBOUND_JOURNAL_MODE=enforced
+CTA_OUTBOX_MODE=enforced
+CTA_RELIABILITY_MODE=enforced
+```
+
+Inbound state lives under `~/.pager/delivery/inbound`; outbound pending,
+completed, dead-letter, uncertain and corrupt records live under
+`~/.pager/delivery/outbound`.
+
 ### Troubleshooting
 
 | Symptom | Cause | Fix |

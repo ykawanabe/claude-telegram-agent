@@ -164,9 +164,11 @@ export interface InboundJournal<Entry, Id = string> {
 
 /** User-visible chat output. Reactions, typing and command registration remain
  * transport capabilities rather than queued messages. */
+export type OutboundButton = string | { label: string; action: string };
+
 export type OutboundMessage =
-  | { kind: "text"; to: ChatAddress; text: string }
-  | { kind: "buttons"; to: ChatAddress; text: string; buttons: string[] };
+  | { kind: "text"; to: ChatAddress; text: string; deliveryKey?: string }
+  | { kind: "buttons"; to: ChatAddress; text: string; buttons: OutboundButton[]; deliveryKey?: string };
 
 /**
  * Ordering seam for user-visible chat output. The Phase 0 implementation is an
@@ -176,6 +178,16 @@ export type OutboundMessage =
  */
 export interface OutboundQueue {
   enqueue(message: OutboundMessage): Promise<void>;
+  enqueueTracked(message: OutboundMessage): Promise<OutboundQueueResult>;
+  /** Durable records which are not yet in a confirmed terminal state. */
+  depth(): number;
+  /** Stop retry polling and wait for an in-flight drain. */
+  stop(): Promise<void>;
+}
+
+export interface OutboundQueueResult {
+  status: "queued" | "delivered" | "retry_scheduled" | "dead_letter" | "uncertain";
+  messageRef?: MessageRef;
 }
 
 // ─── core interface (required) ───────────────────────────────────────────────
@@ -256,7 +268,7 @@ export interface ButtonCapable {
   /** Inline-keyboard choice buttons. On Telegram this is the MCP send_telegram
    *  path (separate process); on Slack/Discord native components; on LINE a
    *  Quick Reply. Each tap returns a `button-press` InboundEvent. */
-  sendButtons(args: { to: ChatAddress; text: string; buttons: string[] }): Promise<MessageRef>;
+  sendButtons(args: { to: ChatAddress; text: string; buttons: OutboundButton[] }): Promise<MessageRef>;
 }
 
 export interface ProactiveCapable {

@@ -58,8 +58,8 @@ h_setup_sandbox() {
   # resolve their helpers under the standard $CTA_INSTALL_DIR layout.
   #
   # Copy whole source dirs, NOT a hand-picked file list. poller.ts's import
-  # graph stays entirely within these five dirs (verified: only ./,
-  # ../channels, ../mount-store, ../tasks-store, ../lib imports). A cherry-picked cp list
+  # graph stays entirely within these dirs (verified: only ./, ../channels,
+  # ../delivery, ../observability, ../mount-store, ../tasks-store, ../lib imports). A cherry-picked cp list
   # silently broke ALL e2e twice — when P4 added buttons-marker.ts, then
   # again when the FDA work added file-access-probe.ts — because CI never
   # runs e2e to catch the drift. Directory copies are self-maintaining: a
@@ -70,6 +70,8 @@ h_setup_sandbox() {
   cp -R "$REPO_DIR/agent/tasks-store" "$CTA_INSTALL_DIR/agent/"
   cp -R "$REPO_DIR/agent/lib" "$CTA_INSTALL_DIR/agent/"
   cp -R "$REPO_DIR/agent/channels" "$CTA_INSTALL_DIR/agent/"
+  cp -R "$REPO_DIR/agent/delivery" "$CTA_INSTALL_DIR/agent/"
+  cp -R "$REPO_DIR/agent/observability" "$CTA_INSTALL_DIR/agent/"
 
   # Plugin .env (the canonical TELEGRAM_BOT_TOKEN source).
   mkdir -p "$SCENARIO_DIR/plugin"

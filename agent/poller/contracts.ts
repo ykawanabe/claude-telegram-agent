@@ -9,6 +9,8 @@ export type DaemonEvent =
   | { kind: "flush"; threadId: string; combinedText: string }
   | { kind: "turn-start"; threadId: string }
   | { kind: "turn-end"; threadId: string; costUsd: number | null; sessionId: string | null }
+  | { kind: "spawn"; threadId: string; spawnedCount: number }
+  | { kind: "crash"; threadId: string; crashCount: number; code: number | null; signal: string | null }
   | { kind: "spawn-failed"; threadId: string }
   | { kind: "crash-loop"; threadId: string; crashCount: number };
 

@@ -76,6 +76,10 @@ beforeEach(() => {
   reactions.length = 0;
   edits.length = 0;
   updateQueue = [];
+  delete process.env.CTA_INBOUND_JOURNAL_MODE;
+  rmSync(join(STATE, "delivery"), { recursive: true, force: true });
+  rmSync(join(STATE, "inbound-inbox"), { recursive: true, force: true });
+  rmSync(join(STATE, "poller-offset"), { force: true });
   writeFileSync(ACCESS_JSON, JSON.stringify({ ackReaction: "👀" }));
 });
 
@@ -116,17 +120,19 @@ describe("wire methods route at the Bot API", () => {
   const t = new TelegramTransport();
 
   test("sendText posts to a chat + thread", async () => {
-    await t.sendText({ to: { channel: "telegram", chatId: -100, threadId: 42 }, text: "hello" });
+    const ref = await t.sendText({ to: { channel: "telegram", chatId: -100, threadId: 42 }, text: "hello" });
     expect(sent).toHaveLength(1);
     expect(sent[0].text).toBe("hello");
     expect(sent[0].message_thread_id).toBe(42);
+    expect(ref).toEqual({ channel: "telegram", chatId: -100, messageId: 1 });
   });
 
   test("sendText chunks text above maxChars", async () => {
     const big = "x".repeat(5000);
-    await t.sendText({ to: { channel: "telegram", chatId: 1 }, text: big });
+    const ref = await t.sendText({ to: { channel: "telegram", chatId: 1 }, text: big });
     expect(sent.length).toBeGreaterThan(1);
     expect(sent.every((s) => s.text.length <= 4096)).toBe(true);
+    expect(ref).toEqual({ channel: "telegram", chatId: 1, messageId: sent.length });
   });
 
   test("setDeliveredAck uses the operator glyph; null when disabled", async () => {
@@ -348,6 +354,40 @@ describe("start/onEvent long-poll loop", () => {
     expect(got).toEqual(["recovered"]);
     expect(existsSync(join(inboxDir, "200.json"))).toBe(false);
     expect(Number(readFileSync(join(STATE, "poller-offset"), "utf8").trim())).toBeGreaterThanOrEqual(201);
+  });
+
+  test("enforced mode suppresses duplicate update IDs", async () => {
+    process.env.CTA_INBOUND_JOURNAL_MODE = "enforced";
+    const t = new TelegramTransport();
+    const got: string[] = [];
+    t.onEvent(async (e) => {
+      if (e.kind !== "message") return;
+      got.push(e.text);
+      await t.stop();
+    });
+    const duplicate = {
+      update_id: 250,
+      message: { message_id: 4, from: { id: 99 }, chat: { id: -100 }, text: "once" },
+    };
+    updateQueue = [duplicate, duplicate];
+    await t.start({});
+    expect(got).toEqual(["once"]);
+  });
+
+  test("handler failure after dispatch is persisted as uncertain", async () => {
+    process.env.CTA_INBOUND_JOURNAL_MODE = "enforced";
+    const t = new TelegramTransport();
+    t.onEvent(async (e) => {
+      if (e.kind !== "message") return;
+      await t.stop();
+      throw new Error("injected handler crash");
+    });
+    updateQueue = [{
+      update_id: 260,
+      message: { message_id: 5, from: { id: 99 }, chat: { id: -100 }, text: "unknown" },
+    }];
+    await t.start({});
+    expect(t.deliveryQueueDepths()["inbound.uncertain"]).toBe(1);
   });
 });
 

@@ -32,10 +32,8 @@ import { join } from "node:path";
 import {
   getUpdates,
   getMe,
-  sendText as wireSendText,
   setReaction,
   editMessageText as wireEditMessageText,
-  sendInlineKeyboard,
   sendChatAction,
   type TgUpdate,
   type TgMessage,
@@ -56,9 +54,16 @@ import type {
   SenderId,
   InboundEvent,
   InboundJournal,
+  OutboundButton,
   AckHandle,
   TypingToken,
 } from "../types";
+import { TelegramOutboundSender } from "../../delivery/outbound";
+import {
+  FileInboundJournal,
+  inboundJournalModeFromEnv,
+  type InboundAdmission,
+} from "../../delivery/inbound";
 
 /** Telegram's documented free-bot reaction whitelist (non-premium bots may only
  *  react with these standard emoji; custom emoji needs Premium / chat-admin).
@@ -79,7 +84,7 @@ const READ_REACTION_EMOJI = "👌";
 const TG_TEXT_MAX_CHARS = 4096;
 
 /** Filesystem implementation of the platform-neutral inbound hand-off. */
-class TelegramInboundJournal implements InboundJournal<TgUpdate, number> {
+class LegacyTelegramInboundInbox implements InboundJournal<TgUpdate, number> {
   constructor(private readonly inboxDir: string) {}
 
   private path(updateId: number): string {
@@ -177,14 +182,19 @@ export class TelegramTransport
   // overlaps) + a hard cap so a loop can't spin forever if the marker is never
   // cleared. The on-disk marker also powers Pager's isGenerating.
   private readonly stateDir = stateDir();
-  private readonly inboundJournal: InboundJournal<TgUpdate, number> =
-    new TelegramInboundJournal(join(this.stateDir, "inbound-inbox"));
+  private readonly legacyInboundInbox: InboundJournal<TgUpdate, number> =
+    new LegacyTelegramInboundInbox(join(this.stateDir, "inbound-inbox"));
+  private readonly inboundJournal = new FileInboundJournal<TgUpdate>({
+    rootDir: join(this.stateDir, "delivery", "inbound"),
+    mode: inboundJournalModeFromEnv(),
+  });
   private readonly typingIntervalMs = Number(process.env.TYPING_INTERVAL_MS ?? "4000");
   private readonly typingMaxMs = Number(process.env.TYPING_MAX_MS ?? `${10 * 60_000}`);
   private readonly emptyPollBackoffMs = (() => {
     const n = Number(process.env.EMPTY_POLL_BACKOFF_MS ?? "100");
     return Number.isFinite(n) && n >= 0 ? n : 100;
   })();
+  private readonly outboundSender = new TelegramOutboundSender();
 
   private handler: ((e: InboundEvent) => Promise<void>) | null = null;
   private running = false;
@@ -208,7 +218,7 @@ export class TelegramTransport
   async start(_opts: { publicUrl?: string }): Promise<void> {
     this.running = true;
     let offset = this.readOffset();
-    offset = await this.replayInbox(offset);
+    offset = await this.recoverInbound(offset);
     while (this.running) {
       this.currentPollAbort = new AbortController();
       let updates: TgUpdate[];
@@ -233,12 +243,25 @@ export class TelegramTransport
         if (this.emptyPollBackoffMs > 0) await new Promise((r) => setTimeout(r, this.emptyPollBackoffMs));
         continue;
       }
-      for (const update of updates) this.inboundJournal.persist(update);
+      const admissions: Array<[TgUpdate, InboundAdmission<TgUpdate>]> = [];
+      for (const update of updates) {
+        // Shadow keeps the old inbox byte-for-byte so the new journal can be
+        // compared without changing crash replay. Enforced makes the state
+        // machine authoritative and therefore does not need the legacy copy.
+        if (this.inboundJournal.mode === "shadow") this.legacyInboundInbox.persist(update);
+        admissions.push([
+          update,
+          this.inboundJournal.receive({
+            messageId: String(update.update_id),
+            payload: update,
+          }),
+        ]);
+      }
       const maxId = Math.max(...updates.map((u) => u.update_id));
       this.writeOffset(maxId + 1);
       offset = maxId + 1;
-      for (const u of updates) {
-        await this.dispatchInboxUpdate(u);
+      for (const [update, admission] of admissions) {
+        await this.dispatchJournaledUpdate(update, admission);
       }
     }
   }
@@ -256,16 +279,58 @@ export class TelegramTransport
     this.currentPollAbort?.abort();
   }
 
-  private async replayInbox(offset: number): Promise<number> {
-    const updates = this.inboundJournal.listPending();
-    if (updates.length === 0) return offset;
-    const recoveredOffset = Math.max(offset, Math.max(...updates.map((u) => u.update_id)) + 1);
+  private async recoverInbound(offset: number): Promise<number> {
+    const legacy = this.legacyInboundInbox.listPending();
+    const recovery = this.inboundJournal.recoverAfterCrash();
+    const recoveredUpdates = [
+      ...recovery.replayable.map((entry) => entry.payload),
+      ...recovery.uncertain.map((record) => record.payload),
+      ...legacy,
+    ];
+    if (recoveredUpdates.length === 0) return offset;
+    const recoveredOffset = Math.max(offset, Math.max(...recoveredUpdates.map((u) => u.update_id)) + 1);
     if (recoveredOffset !== offset) this.writeOffset(recoveredOffset);
-    for (const update of updates) await this.dispatchInboxUpdate(update);
+
+    // Legacy records are also the migration path for installations upgraded
+    // from the Phase-0 inbox. Prefer the durable record when it is replayable;
+    // terminal records go through receive() so shadow records the comparison
+    // and enforced suppresses/holds them.
+    const legacyIds = new Set(legacy.map((update) => update.update_id));
+    for (const update of legacy) {
+      const existing = this.inboundJournal.get(String(update.update_id));
+      if (existing?.state === "received") {
+        await this.dispatchManagedUpdate(update);
+      } else {
+        const admission = this.inboundJournal.receive({
+          messageId: String(update.update_id),
+          payload: update,
+        });
+        await this.dispatchJournaledUpdate(update, admission);
+      }
+    }
+    for (const entry of recovery.replayable) {
+      if (!legacyIds.has(entry.payload.update_id)) await this.dispatchManagedUpdate(entry.payload);
+    }
     return recoveredOffset;
   }
 
-  private async dispatchInboxUpdate(update: TgUpdate): Promise<void> {
+  private async dispatchJournaledUpdate(
+    update: TgUpdate,
+    admission: InboundAdmission<TgUpdate>,
+  ): Promise<void> {
+    if (admission.action !== "process") {
+      this.legacyInboundInbox.remove(update.update_id);
+      process.stdout.write(
+        `[${new Date().toISOString()}] inbound ${admission.action} (update ${update.update_id}, ${admission.classification})\n`,
+      );
+      return;
+    }
+    if (admission.managed) {
+      await this.dispatchManagedUpdate(update);
+      return;
+    }
+    // Shadow duplicate/unknown: intentionally exercise the legacy path while
+    // leaving the first durable record untouched for comparison.
     try {
       const ev = normalizeUpdate(update);
       if (ev && this.handler) await this.handler(ev);
@@ -276,7 +341,51 @@ export class TelegramTransport
         `[${new Date().toISOString()}] inbound dispatch error (update ${update.update_id}, discarded): ${e instanceof Error ? (e.stack ?? e.message) : String(e)}\n`,
       );
     }
-    this.inboundJournal.remove(update.update_id);
+    this.legacyInboundInbox.remove(update.update_id);
+  }
+
+  private async dispatchManagedUpdate(update: TgUpdate): Promise<void> {
+    const messageId = String(update.update_id);
+    const claim = this.inboundJournal.claim(messageId, `telegram-poller:${process.pid}`);
+    const claimToken = claim.claim!.token;
+    let event: InboundEvent | null;
+    try {
+      event = normalizeUpdate(update);
+    } catch (error) {
+      this.inboundJournal.markLost(
+        messageId,
+        claimToken,
+        `normalization failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      this.legacyInboundInbox.remove(update.update_id);
+      return;
+    }
+
+    this.inboundJournal.markDispatched(messageId, claimToken);
+    try {
+      if (event && this.handler) await this.handler(event);
+      this.inboundJournal.complete(messageId, claimToken);
+    } catch (error) {
+      this.inboundJournal.markOutcomeUnknown(
+        messageId,
+        claimToken,
+        `handler result unknown: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      process.stderr.write(
+        `[${new Date().toISOString()}] inbound dispatch outcome unknown (update ${update.update_id}): ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
+      );
+    } finally {
+      this.legacyInboundInbox.remove(update.update_id);
+    }
+  }
+
+  /** Queue gauges used by the reliability sampler without exposing payloads. */
+  deliveryQueueDepths(): Record<string, number> {
+    const states = this.inboundJournal.summary().states;
+    return {
+      "inbound.replayable": states.received + states.claimed,
+      "inbound.uncertain": states.uncertain,
+    };
   }
 
   async whoami(): Promise<{ id: string; username?: string; displayName?: string }> {
@@ -288,10 +397,7 @@ export class TelegramTransport
     if (to.channel !== "telegram") throw new Error("TelegramTransport.sendText: wrong channel");
     let lastRef: MessageRef = { channel: "telegram", chatId: to.chatId, messageId: 0 };
     for (const chunk of chunkText(text, this.capabilities.text.maxChars)) {
-      await wireSendText({ chat_id: to.chatId, thread_id: to.threadId }, chunk);
-      // The plain sendMessage wire is best-effort (no id returned); the ref
-      // carries the chat coordinates, sufficient for the poller's current use.
-      lastRef = { channel: "telegram", chatId: to.chatId, messageId: 0 };
+      lastRef = await this.outboundSender.send({ kind: "text", to, text: chunk });
     }
     return lastRef;
   }
@@ -357,7 +463,7 @@ export class TelegramTransport
   }: {
     to: ChatAddress;
     text: string;
-    buttons: string[];
+    buttons: OutboundButton[];
   }): Promise<MessageRef> {
     if (to.channel !== "telegram") throw new Error("TelegramTransport.sendButtons: wrong channel");
     // One button per row. callback_data carries the thread + label as
@@ -365,13 +471,7 @@ export class TelegramTransport
     // tapped label back into the right topic as the user's next message
     // (same wire the retired mcp-telegram used). Bot API caps callback_data at
     // 64 bytes, so the encoded string is trimmed to fit.
-    const tid = to.threadId ?? "dm";
-    const rows = buttons.map((label) => [{
-      text: label,
-      callback_data: `ans:${tid}:${label}`.slice(0, 64),
-    }]);
-    const res = await sendInlineKeyboard(to.chatId, text, rows, to.threadId);
-    return { channel: "telegram", chatId: to.chatId, messageId: res?.message_id ?? 0 };
+    return this.outboundSender.send({ kind: "buttons", to, text, buttons });
   }
 
   // ─── ProactiveCapable ────────────────────────────────────────────────────────

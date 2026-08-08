@@ -49,6 +49,7 @@ describe("ClaudeDaemonRegistry basic dispatch", () => {
     await waitFor(() => events.some((event) => event.kind === "turn-end"), 5000);
 
     expect(events.map((event) => event.kind)).toEqual([
+      "spawn",
       "flush",
       "turn-start",
       "text",

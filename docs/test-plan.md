@@ -52,6 +52,10 @@ E2E is opt-in (not in `tests/run.sh`) because it spends real money.
 | 19 | No "typing…" indicator while claude is thinking | live | `poller.test.ts: sendTyping fires sendChatAction with 'typing' action` | ✓ |
 | 20 | `tmux dispatch` test counts global buffers, fails when live agent shares the server | live | `tests/test_tmux_dispatch.sh` — delta-based check | ✓ |
 | 21 | `paste-buffer -d` race: messages stack as multi-line prompt instead of separate submits | live | no test (claude TUI behavior; would need TUI scripting) | gap ⚠ |
+| 22 | Cursor advances before inbound work is durable, losing a Telegram update on crash | Wave 1 | `agent/delivery/inbound/journal.fault.test.ts` + `agent/channels/telegram/transport.test.ts` | ✓ |
+| 23 | Crash after dispatch causes an unsafe automatic duplicate | Wave 1 | `journal.fault.test.ts: replays received and claimed, but quarantines dispatched` | ✓ |
+| 24 | Telegram 429/5xx output disappears instead of retrying with server delay | Wave 1 | `agent/delivery/outbound/outbox.test.ts` + `telegram-sender.test.ts` | ✓ |
+| 25 | Telemetry ENOSPC/corruption unwinds delivery or hides all prior events | Wave 1 | `tests/reliability/events.test.ts` + `fault-injection.test.ts` | ✓ |
 
 ## Gaps (P1 → P4)
 

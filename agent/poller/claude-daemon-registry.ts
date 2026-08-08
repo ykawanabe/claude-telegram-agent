@@ -174,6 +174,11 @@ export class ClaudeDaemonRegistry implements ResourceRegistryPort {
           sessionId: event.sessionId,
         });
         return;
+      case "spawn":
+      case "crash":
+        // Structured lifecycle observations have no legacy callback. They are
+        // consumed by EventSink-based reliability instrumentation only.
+        return;
       case "spawn-failed":
         this.opts.onSpawnFail?.(event.threadId);
         return;
@@ -766,6 +771,13 @@ export class ClaudeDaemonRegistry implements ResourceRegistryPort {
       // crash-loop notice exactly once when we cross the threshold (claude spawns
       // fine but dies every turn — bad /model, corrupt session JSONL, auth error).
       h.crashCount += 1;
+      this.emitEvent({
+        kind: "crash",
+        threadId,
+        crashCount: h.crashCount,
+        code: info.code,
+        signal: info.signal,
+      });
       const crashThreshold = this.opts.crashLoopThreshold ?? 3;
       if (h.crashCount === crashThreshold) {
         this.emitEvent({ kind: "crash-loop", threadId, crashCount: h.crashCount });
@@ -798,6 +810,7 @@ export class ClaudeDaemonRegistry implements ResourceRegistryPort {
     handle.daemon = daemon;
     handle.spawnedCount += 1;
     handle.state = "idle";
+    this.emitEvent({ kind: "spawn", threadId, spawnedCount: handle.spawnedCount });
     return true;
   }
 }

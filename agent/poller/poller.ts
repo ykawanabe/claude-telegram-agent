@@ -70,7 +70,6 @@ import { renderApprovalCard, approvalButtonRows, parseApprovalCallback, applyEdi
 // unchanged). The poller keeps the *policy* — ack on/off + glyph, typing
 // keepalive, offset — and drives this dumb wire. See ../channels/telegram/adapter.ts.
 import {
-  sendInlineKeyboard,
   answerCallback,
   getUpdates,
   getMe,
@@ -87,6 +86,15 @@ import type {
 } from "../channels/telegram/adapter";
 import { makeOutboundQueue, makeTransport } from "../channels/transport-factory";
 import { isButtonCapable, isEditable, isInterruptible, isReactable, isTyping, type AckHandle, type ChatAddress, type ChatTransport, type Channel, type InboundEvent } from "../channels/types";
+import type { OutboxEvent } from "../delivery/outbound";
+import {
+  JsonlEventSink,
+  ReliabilityGate,
+  ReliabilityMonitor,
+  StructuredEventReporter,
+  createObservedDaemonEventSink,
+  createSafeReliabilityHooks,
+} from "../observability";
 
 /** The normalized message-kind event the command pipeline consumes (replaces the
  *  raw TgMessage every handler used to take). Carries everything a handler needs
@@ -126,8 +134,51 @@ function chatIdOf(ev: InboundMessageEvent): number {
 // Phase 0: only Telegram is registered in the factory; CTA_CHANNEL unset →
 // "telegram", so production is unchanged.
 const activeChannel: Channel = (process.env.CTA_CHANNEL as Channel) ?? "telegram";
+let reportedObservabilitySinkFailure = false;
+const reliabilityReporter = new StructuredEventReporter({
+  source: "poller",
+  sink: new JsonlEventSink(join(stateDir(), "observability", "events.jsonl")),
+  onSinkError(error) {
+    if (reportedObservabilitySinkFailure) return;
+    reportedObservabilitySinkFailure = true;
+    process.stderr.write(`poller: observability sink failed: ${error instanceof Error ? error.message : String(error)}\n`);
+  },
+});
+const reliabilityMonitor = new ReliabilityMonitor({ reporter: reliabilityReporter });
+const reliabilityHooks = createSafeReliabilityHooks(reliabilityMonitor);
+const reliabilityGate = new ReliabilityGate({
+  reporter: reliabilityReporter,
+  thresholds: {
+    maxQueueDepth: Number(process.env.CTA_MAX_QUEUE_DEPTH ?? "1000"),
+    maxTurnP95Ms: Number(process.env.CTA_MAX_TURN_P95_MS ?? `${10 * 60_000}`),
+    maxTelegramFailureRate: Number(process.env.CTA_MAX_TELEGRAM_FAILURE_RATE ?? "0.25"),
+    minTelegramSamples: Number(process.env.CTA_MIN_TELEGRAM_SAMPLES ?? "20"),
+    maxRssBytes: Number(process.env.CTA_MAX_RSS_BYTES ?? `${2 * 1024 * 1024 * 1024}`),
+  },
+});
+const outboundAttemptStartedAt = new Map<string, number>();
+function observeOutboxEvent(event: OutboxEvent): void {
+  if (event.name === "outbox.attempt_started") {
+    outboundAttemptStartedAt.set(event.outboxId, event.at);
+    return;
+  }
+  const terminalAttempt = event.name === "outbox.delivered"
+    || event.name === "outbox.retry_scheduled"
+    || event.name === "outbox.dead_lettered"
+    || event.name === "outbox.uncertain";
+  if (!terminalAttempt) return;
+  const startedAt = outboundAttemptStartedAt.get(event.outboxId);
+  outboundAttemptStartedAt.delete(event.outboxId);
+  reliabilityHooks.recordTelegramRequest({
+    operation: "sendMessage",
+    ok: event.name === "outbox.delivered",
+    status: event.httpStatus,
+    latencyMs: startedAt == null ? undefined : Math.max(0, event.at - startedAt),
+    retryAfterMs: event.retryAfterMs,
+  });
+}
 const transport: ChatTransport = makeTransport(activeChannel);
-const outboundQueue = makeOutboundQueue(transport);
+const outboundQueue = makeOutboundQueue(transport, { events: observeOutboxEvent });
 
 /** Outbound plain text. Flows through transport.sendText (which chunks >4096 and
  *  returns a ref). Takes a platform-agnostic ChatAddress — the poller no longer
@@ -923,6 +974,9 @@ const daemonEventSink: EventSink = {
           sessionId: event.sessionId,
         });
         return;
+      case "spawn":
+      case "crash":
+        return;
       case "spawn-failed":
         onDaemonSpawnFail(event.threadId);
         return;
@@ -932,6 +986,7 @@ const daemonEventSink: EventSink = {
     }
   },
 };
+const observedDaemonEventSink = createObservedDaemonEventSink(reliabilityMonitor, daemonEventSink);
 
 /** Initialize the daemon registry. Called once in main(). */
 function initDaemonRegistry(): void {
@@ -960,7 +1015,7 @@ function initDaemonRegistry(): void {
     // wedge). Without this, the only recovery was the 5-min inFlight watchdog →
     // 5 min of silence. 12s SIGKILLs + respawns + flushes the steer instead.
     interruptEscalateMs: Number(process.env.PAGER_INTERRUPT_ESCALATE_MS ?? "12000"),
-    eventSink: daemonEventSink,
+    eventSink: observedDaemonEventSink,
   });
 }
 
@@ -2340,7 +2395,12 @@ async function promptMountChoice(thread_id: number | "dm", chat_id: number, thre
     return;
   }
   const buttons = cands.map((p, i) => [{ text: mountBasename(p), callback_data: `mnt:${tid}:${i}` }]);
-  await sendInlineKeyboard(chat_id, "This topic isn't linked to a project yet. Pick one, or send `/mount <path>`:", buttons);
+  await outboundQueue.enqueue({
+    kind: "buttons",
+    to: tgAddr(chat_id, threadIdRaw),
+    text: "This topic isn't linked to a project yet. Pick one, or send `/mount <path>`:",
+    buttons: buttons.flat().map((button) => ({ label: button.text, action: button.callback_data })),
+  });
 }
 
 /** Topic-name harvest from a normalized topic-created/topic-renamed event. The
@@ -2432,9 +2492,10 @@ async function onInboundMessage(ev: InboundMessageEvent): Promise<void> {
   // The registry owns spawn-if-needed, 2s debounce, per-topic queue, and
   // crash respawn. Reply text streams back asynchronously via the
   // postTelegramTextFromDaemon callback wired in initDaemonRegistry().
-  // Fire-and-forget: daemonDispatch awaits the delivered-ack internally before
-  // enqueue, but the caller need not block on it.
-  void daemonDispatch(ev.routingKey, ev);
+  // Await through the durable inbound handler boundary. daemonDispatch returns
+  // once the registry has accepted the prompt, so the journal never marks a
+  // message completed while its enqueue is still pending in a detached task.
+  await daemonDispatch(ev.routingKey, ev);
   process.stdout.write(`[${new Date().toISOString()}] msg → daemon[${ev.routingKey}] (${text0.length} chars)\n`);
 }
 
@@ -2554,8 +2615,16 @@ function approvalDispatch(): void {
     if (req.status === "sent" || approvalsSent.has(req.id)) continue;
     approvalsSent.add(req.id); // sync guard so the next 5s tick can't double-send
     const threadIdNum = req.threadId === "dm" ? undefined : Number(req.threadId);
-    void sendInlineKeyboard(req.chatId, renderApprovalCard(req), approvalButtonRows(req.id), threadIdNum)
-      .then((res) => { if (res) markSent(APPROVALS_DIR, req.id); else approvalsSent.delete(req.id); })
+    const buttons = approvalButtonRows(req.id).flat()
+      .map((button) => ({ label: button.text, action: button.callback_data }));
+    void outboundQueue.enqueueTracked({
+      kind: "buttons",
+      to: tgAddr(req.chatId, threadIdNum),
+      text: renderApprovalCard(req),
+      buttons,
+      deliveryKey: `approval:${req.id}`,
+    })
+      .then(() => { markSent(APPROVALS_DIR, req.id); })
       .catch(() => { approvalsSent.delete(req.id); });
   }
 }
@@ -3019,6 +3088,7 @@ export async function main(): Promise<void> {
       process.stdout.write(`[${new Date().toISOString()}] poller: ${sig} received — shutting down daemons\n`);
       void (async () => {
         if (daemonRegistry) await daemonRegistry.shutdown();
+        await outboundQueue.stop();
         process.exit(0);
       })();
     });
@@ -3050,6 +3120,24 @@ export async function main(): Promise<void> {
   refreshPairedIfChanged();
   refreshSettingsIfChanged();
   initDaemonRegistry();
+  const stopReliabilitySampling = reliabilityMonitor.startSampling({
+    queueDepths: () => {
+      const daemonPending = daemonRegistry?.snapshotQueues()
+        .reduce((total, [, queue]) => total + queue.length, 0) ?? 0;
+      const deliveryDepths = typeof (transport as ChatTransport & {
+        deliveryQueueDepths?: () => Record<string, number>;
+      }).deliveryQueueDepths === "function"
+        ? (transport as ChatTransport & {
+          deliveryQueueDepths: () => Record<string, number>;
+        }).deliveryQueueDepths()
+        : {};
+      return {
+        "daemon.pending": daemonPending,
+        "outbound.pending": outboundQueue.depth(),
+        ...deliveryDepths,
+      };
+    },
+  });
   startInjectWatcher();
   await processInjectFlags(); // drain anything dropped before this poller started
   // File-access (FDA) self-probe: we're in the launchd TCC context here, so this
@@ -3115,6 +3203,7 @@ export async function main(): Promise<void> {
           runFileAccessProbe(STATE_DIR);
         }
         await resourceGovernor.sweep();
+        reliabilityGate.evaluate(reliabilityMonitor.snapshot());
         // β handoff release/reacquire flags + watch-live inject. fs.watch
         // handles immediacy; this is the steady-state fallback drain.
         await processReleaseFlags();
@@ -3162,8 +3251,13 @@ export async function main(): Promise<void> {
         return;
     }
   });
-  await transport.start({});
-  clearInterval(housekeepTimer); // unreachable in steady state (start() blocks)
+  try {
+    await transport.start({});
+  } finally {
+    clearInterval(housekeepTimer); // normally unreachable (start() blocks)
+    stopReliabilitySampling();
+    await outboundQueue.stop();
+  }
 }
 
 // Tests import this module to drive command handlers directly. Only run the

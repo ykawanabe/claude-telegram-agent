@@ -89,4 +89,44 @@ describe("makeOutboundQueue", () => {
 
     expect(sent).toEqual(["Choose:"]);
   });
+
+  test("returns the real send result and deduplicates a stable delivery key", async () => {
+    let sends = 0;
+    const transport: ChatTransport = {
+      channel: "telegram",
+      transportVersion: 1,
+      capabilities: new TelegramTransport().capabilities,
+      async start() {},
+      async stop() {},
+      onEvent() {},
+      async whoami() { return { id: "1" }; },
+      async sendText() {
+        sends += 1;
+        return { channel: "telegram", chatId: 1, messageId: 700 + sends };
+      },
+      mountCacheKey() { return "telegram:dm"; },
+      routingKey() { return "dm" as never; },
+    };
+    const queue = makeOutboundQueue(transport, {
+      mode: "enforced",
+      rootDir: join(STATE, `tracked-${Date.now()}-${Math.random()}`),
+    });
+    const message = {
+      kind: "text" as const,
+      to: { channel: "telegram" as const, chatId: 1 },
+      text: "stable",
+      deliveryKey: "approval:123",
+    };
+
+    const first = await queue.enqueueTracked(message);
+    const second = await queue.enqueueTracked(message);
+    await queue.stop();
+
+    expect(first).toEqual({
+      status: "delivered",
+      messageRef: { channel: "telegram", chatId: 1, messageId: 701 },
+    });
+    expect(second).toEqual(first);
+    expect(sends).toBe(1);
+  });
 });

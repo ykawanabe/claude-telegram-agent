@@ -8,9 +8,9 @@ type Equal<Left, Right> =
     : false;
 type Expect<Condition extends true> = Condition;
 
-type _ExactlySixEventKinds = Expect<Equal<
+type _ExactlyEightEventKinds = Expect<Equal<
   DaemonEvent["kind"],
-  "text" | "flush" | "turn-start" | "turn-end" | "spawn-failed" | "crash-loop"
+  "text" | "flush" | "turn-start" | "turn-end" | "spawn" | "crash" | "spawn-failed" | "crash-loop"
 >>;
 
 type _TurnEndPayloadIsFlat = Expect<Equal<
@@ -33,6 +33,10 @@ function route(event: DaemonEvent): string {
       return `${event.threadId}:turn-start`;
     case "turn-end":
       return `${event.threadId}:turn-end:${event.costUsd}:${event.sessionId}`;
+    case "spawn":
+      return `${event.threadId}:spawn:${event.spawnedCount}`;
+    case "crash":
+      return `${event.threadId}:crash:${event.crashCount}:${event.code}:${event.signal}`;
     case "spawn-failed":
       return `${event.threadId}:spawn-failed`;
     case "crash-loop":
@@ -50,6 +54,8 @@ describe("DaemonEvent", () => {
       { kind: "flush", threadId: "topic-1", combinedText: "hello\nworld" },
       { kind: "turn-start", threadId: "topic-1" },
       { kind: "turn-end", threadId: "topic-1", costUsd: 0.25, sessionId: "session-1" },
+      { kind: "spawn", threadId: "topic-1", spawnedCount: 1 },
+      { kind: "crash", threadId: "topic-1", crashCount: 1, code: 1, signal: null },
       { kind: "spawn-failed", threadId: "topic-1" },
       { kind: "crash-loop", threadId: "topic-1", crashCount: 3 },
     ] satisfies DaemonEvent[];
@@ -59,6 +65,8 @@ describe("DaemonEvent", () => {
       "topic-1:flush:hello\nworld",
       "topic-1:turn-start",
       "topic-1:turn-end:0.25:session-1",
+      "topic-1:spawn:1",
+      "topic-1:crash:1:1:null",
       "topic-1:spawn-failed",
       "topic-1:crash-loop:3",
     ]);
