@@ -167,6 +167,9 @@ if [[ -d "$REPO_DIR/agent" ]]; then
   cp "$REPO_DIR/agent/lib/paths.ts" "$AGENT_DIR/lib/"
   cp "$REPO_DIR/agent/poller/poller.ts" \
      "$REPO_DIR/agent/poller/package.json" \
+     "$REPO_DIR/agent/poller/contracts.ts" \
+     "$REPO_DIR/agent/poller/bot-feature.ts" \
+     "$REPO_DIR/agent/poller/transcript-cursor.ts" \
      "$REPO_DIR/agent/poller/claude-daemon.ts" \
      "$REPO_DIR/agent/poller/claude-daemon-registry.ts" \
      "$REPO_DIR/agent/poller/buttons-marker.ts" \

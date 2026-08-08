@@ -25,6 +25,9 @@ watch_network.sh	bin	755
 # Poller (TypeScript / bun)
 poller/poller.ts	agent	644
 poller/package.json	agent	644
+poller/contracts.ts	agent	644
+poller/bot-feature.ts	agent	644
+poller/transcript-cursor.ts	agent	644
 poller/claude-daemon.ts	agent	644
 poller/claude-daemon-registry.ts	agent	644
 poller/buttons-marker.ts	agent	644

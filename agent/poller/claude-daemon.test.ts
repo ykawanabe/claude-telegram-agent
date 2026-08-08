@@ -89,6 +89,19 @@ describe("ClaudeDaemon streaming output (multi-block turn)", () => {
     expect(texts[0]).toBe("thinking…");
     expect(texts[1]).toBe("answer: hi");
   });
+
+  test("does not expose an unterminated stdout tail until a newline arrives", () => {
+    const daemon = new ClaudeDaemon({ claudeBin: FIXTURE, cwd: "/tmp" });
+    const texts: string[] = [];
+    daemon.on("text", (s: string) => texts.push(s));
+    const feedStdout = daemon as unknown as { onStdout(chunk: string): void };
+
+    feedStdout.onStdout('{"type":"assistant","message":{"content":[{"type":"text","text":"tail"}]}}');
+    expect(texts).toEqual([]);
+
+    feedStdout.onStdout("\n");
+    expect(texts).toEqual(["tail"]);
+  });
 });
 
 describe("ClaudeDaemon crash recovery", () => {

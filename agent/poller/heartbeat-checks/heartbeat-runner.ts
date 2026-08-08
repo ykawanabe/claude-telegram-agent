@@ -26,6 +26,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { parseHeartbeatMd } from "./heartbeat-md";
 import { runCheck, type CheckResult, type HandlerContext } from "./registry";
+import { createTranscriptCursor } from "../transcript-cursor";
 
 // Public types ───────────────────────────────────────────────────────────────
 
@@ -175,30 +176,12 @@ interface StreamParseResult {
  *  noise lines (claude occasionally emits them at startup). Same shape as the
  *  daemon's handleEvent loop in claude-daemon.ts. */
 export function parseStreamJson(stdout: string): StreamParseResult {
+  const cursor = createTranscriptCursor();
   let assistantText = "";
   let totalCostUsd = 0;
-  for (const line of stdout.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let event: unknown;
-    try {
-      event = JSON.parse(trimmed);
-    } catch {
-      continue;
-    }
-    if (!event || typeof event !== "object") continue;
-    const e = event as { type?: string; message?: unknown; total_cost_usd?: unknown };
-    if (e.type === "assistant") {
-      const msg = e.message as { content?: Array<{ type: string; text?: string }> } | undefined;
-      const blocks = msg?.content ?? [];
-      for (const block of blocks) {
-        if (block.type === "text" && typeof block.text === "string") {
-          assistantText += block.text;
-        }
-      }
-    } else if (e.type === "result") {
-      if (typeof e.total_cost_usd === "number") totalCostUsd = e.total_cost_usd;
-    }
+  for (const event of [...cursor.push(stdout), ...cursor.finish()]) {
+    if (event.type === "assistant") assistantText += event.text;
+    else if (event.costUsd !== undefined) totalCostUsd = event.costUsd;
   }
   return { assistantText, totalCostUsd };
 }

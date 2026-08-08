@@ -145,6 +145,39 @@ export type InboundEvent<Raw = unknown> =
   // loop → process.exit → launchd respawn.
   | { kind: "transport-degraded"; reason: string };
 
+// ─── delivery boundaries ────────────────────────────────────────────────────
+
+/**
+ * Durable hand-off used by pull transports before they advance a remote
+ * cursor. `persist` is synchronous and must either make the entry recoverable
+ * or throw. `listPending` returns recovery order; `remove` is idempotent and
+ * best-effort after dispatch.
+ *
+ * This deliberately does not promise exactly-once delivery. A crash may replay
+ * an entry whose side effects completed before `remove`.
+ */
+export interface InboundJournal<Entry, Id = string> {
+  persist(entry: Entry): void;
+  listPending(): Entry[];
+  remove(id: Id): void;
+}
+
+/** User-visible chat output. Reactions, typing and command registration remain
+ * transport capabilities rather than queued messages. */
+export type OutboundMessage =
+  | { kind: "text"; to: ChatAddress; text: string }
+  | { kind: "buttons"; to: ChatAddress; text: string; buttons: string[] };
+
+/**
+ * Ordering seam for user-visible chat output. The Phase 0 implementation is an
+ * immediate pass-through: resolution means the transport's send attempt has
+ * finished. It does NOT yet promise persistence, retry, deduplication,
+ * backpressure or confirmed platform delivery.
+ */
+export interface OutboundQueue {
+  enqueue(message: OutboundMessage): Promise<void>;
+}
+
 // ─── core interface (required) ───────────────────────────────────────────────
 
 /** REQUIRED. Every adapter implements exactly this. */

@@ -12,6 +12,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { ClaudeDaemonRegistry } from "./claude-daemon-registry";
+import type { DaemonEvent } from "./contracts";
 
 const FIXTURE = join(import.meta.dir, "fixtures/fake-claude-daemon.sh");
 
@@ -33,6 +34,31 @@ describe("ClaudeDaemonRegistry basic dispatch", () => {
 
     expect(texts[0]).toBe("You said: hello");
     expect(reg.daemonCount).toBe(1);
+  });
+
+  test("EventSink replaces the legacy callback surface without changing order", async () => {
+    const events: DaemonEvent[] = [];
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 50,
+      daemonOptsFor: () => ({ cwd: "/tmp" }),
+      eventSink: { emit: (event) => events.push(event) },
+    });
+
+    reg.enqueue("topic-42", "hello");
+    await waitFor(() => events.some((event) => event.kind === "turn-end"), 5000);
+
+    expect(events.map((event) => event.kind)).toEqual([
+      "flush",
+      "turn-start",
+      "text",
+      "turn-end",
+    ]);
+    expect(events.find((event) => event.kind === "text")).toEqual({
+      kind: "text",
+      threadId: "topic-42",
+      text: "You said: hello",
+    });
   });
 
   test("subsequent messages reuse the warm daemon (no respawn)", async () => {

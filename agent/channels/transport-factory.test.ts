@@ -16,8 +16,9 @@ process.env.CTA_STATE_DIR = STATE;
 process.env.ACCESS_JSON = join(STATE, "access.json");
 process.env.TELEGRAM_BOT_TOKEN = "fake";
 
-import { makeTransport } from "./transport-factory";
+import { makeOutboundQueue, makeTransport } from "./transport-factory";
 import { TelegramTransport } from "./telegram/transport";
+import type { ChatTransport, MessageRef } from "./types";
 
 describe("makeTransport", () => {
   test('"telegram" → TelegramTransport', () => {
@@ -32,5 +33,60 @@ describe("makeTransport", () => {
     // Slack/discord/line are valid Channel values but not yet registered.
     expect(() => makeTransport("slack" as never)).toThrow(/unsupported/);
     expect(() => makeTransport("bogus" as never)).toThrow(/unsupported/);
+  });
+});
+
+describe("makeOutboundQueue", () => {
+  test("passes text through immediately and awaits the send attempt", async () => {
+    const sent: string[] = [];
+    const ref: MessageRef = { channel: "telegram", chatId: 1, messageId: 1 };
+    const transport: ChatTransport = {
+      channel: "telegram",
+      transportVersion: 1,
+      capabilities: new TelegramTransport().capabilities,
+      async start() {},
+      async stop() {},
+      onEvent() {},
+      async whoami() { return { id: "1" }; },
+      async sendText({ text }) { sent.push(text); return ref; },
+      mountCacheKey() { return "telegram:dm"; },
+      routingKey() { return "dm" as never; },
+    };
+
+    await makeOutboundQueue(transport).enqueue({
+      kind: "text",
+      to: { channel: "telegram", chatId: 1 },
+      text: "hello",
+    });
+
+    expect(sent).toEqual(["hello"]);
+  });
+
+  test("degrades buttons to plain text when the transport lacks that capability", async () => {
+    const sent: string[] = [];
+    const transport: ChatTransport = {
+      channel: "telegram",
+      transportVersion: 1,
+      capabilities: new TelegramTransport().capabilities,
+      async start() {},
+      async stop() {},
+      onEvent() {},
+      async whoami() { return { id: "1" }; },
+      async sendText({ text }) {
+        sent.push(text);
+        return { channel: "telegram", chatId: 1, messageId: 1 };
+      },
+      mountCacheKey() { return "telegram:dm"; },
+      routingKey() { return "dm" as never; },
+    };
+
+    await makeOutboundQueue(transport).enqueue({
+      kind: "buttons",
+      to: { channel: "telegram", chatId: 1 },
+      text: "Choose:",
+      buttons: ["A"],
+    });
+
+    expect(sent).toEqual(["Choose:"]);
   });
 });

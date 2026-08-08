@@ -17,6 +17,7 @@
  *     any ─crash─→ crashed ─enqueue─→ idle (respawn on next message)
  */
 import { ClaudeDaemon, type ClaudeDaemonOptions, type TurnEndInfo, type CrashInfo } from "./claude-daemon";
+import type { DaemonEvent, EventSink, ResourceRegistryPort } from "./contracts";
 
 export interface RegistryOptions {
   /** Default 2000ms — collapse messages arriving within this window. */
@@ -34,8 +35,12 @@ export interface RegistryOptions {
   claudeBin?: string;
   /** Per-topic daemon options — called lazily to build cwd/uuid/etc. */
   daemonOptsFor: (threadId: string) => Omit<ClaudeDaemonOptions, "claudeBin">;
-  /** Called for every assistant text block — Telegram-post side effect. */
-  onText: (threadId: string, text: string) => void;
+  /** Preferred Phase 0 registry observation boundary. Synchronous/nonthrowing;
+   *  when present it replaces the six legacy callbacks below. */
+  eventSink?: EventSink;
+  /** Legacy callback surface retained for compatible construction in tests and
+   *  downstream callers. Production wiring now uses eventSink. */
+  onText?: (threadId: string, text: string) => void;
   /** Optional: called when a batch is flushed to claude (text already sent). */
   onFlush?: (threadId: string, combinedText: string) => void;
   /** Optional: turn-start callback — fired when a flushed batch is sent to the
@@ -137,12 +142,45 @@ interface DaemonHandle {
   turnEndResolver: (() => void) | null;
 }
 
-export class ClaudeDaemonRegistry {
+export class ClaudeDaemonRegistry implements ResourceRegistryPort {
   private readonly opts: RegistryOptions;
   private readonly handles: Map<string, DaemonHandle> = new Map();
 
   constructor(opts: RegistryOptions) {
     this.opts = opts;
+  }
+
+  /** Route one registry observation through the new sink, falling back to the
+   *  exact legacy callback for compatibility. Ordering and throw behavior are
+   *  intentionally unchanged. */
+  private emitEvent(event: DaemonEvent): void {
+    if (this.opts.eventSink) {
+      this.opts.eventSink.emit(event);
+      return;
+    }
+    switch (event.kind) {
+      case "text":
+        this.opts.onText?.(event.threadId, event.text);
+        return;
+      case "flush":
+        this.opts.onFlush?.(event.threadId, event.combinedText);
+        return;
+      case "turn-start":
+        this.opts.onTurnStart?.(event.threadId);
+        return;
+      case "turn-end":
+        this.opts.onTurnEnd?.(event.threadId, {
+          costUsd: event.costUsd,
+          sessionId: event.sessionId,
+        });
+        return;
+      case "spawn-failed":
+        this.opts.onSpawnFail?.(event.threadId);
+        return;
+      case "crash-loop":
+        this.opts.onCrashLoop?.(event.threadId, event.crashCount);
+        return;
+    }
   }
 
   /** Total number of live daemons (state != released/crashed). */
@@ -608,7 +646,7 @@ export class ClaudeDaemonRegistry {
         handle.state = "crashed";
         // Surface the spawn failure — otherwise the user's message sits queued
         // in silence (typing times out, no error ever reaches the chat).
-        this.opts.onSpawnFail?.(threadId);
+        this.emitEvent({ kind: "spawn-failed", threadId });
         return;
       }
     }
@@ -622,13 +660,13 @@ export class ClaudeDaemonRegistry {
     handle.state = "inFlight";
 
     try {
-      this.opts.onFlush?.(threadId, combined);
+      this.emitEvent({ kind: "flush", threadId, combinedText: combined });
       await handle.daemon!.send(combined);
       // Turn is now in-flight — signal turn-start so the poller can (re-)assert
       // the typing indicator. Fires on EVERY turn, so a steered continuation
       // after a mid-turn interrupt re-arms typing (the interrupted turn-end
       // cleared the marker).
-      this.opts.onTurnStart?.(threadId);
+      this.emitEvent({ kind: "turn-start", threadId });
       // Start the inactivity watchdog: if the daemon emits no text and no
       // turn-end/crash before it fires, the turn is presumed wedged.
       this.armInFlightWatchdog(threadId, handle);
@@ -673,11 +711,16 @@ export class ClaudeDaemonRegistry {
       // recover promptly even if claude keeps dribbling out the old answer.
       const h = this.handles.get(threadId);
       if (h && h.state === "inFlight" && !h.postInterrupt) this.armInFlightWatchdog(threadId, h);
-      this.opts.onText(threadId, text);
+      this.emitEvent({ kind: "text", threadId, text });
     });
 
     daemon.on("turn-end", (info: TurnEndInfo) => {
-      this.opts.onTurnEnd?.(threadId, info);
+      this.emitEvent({
+        kind: "turn-end",
+        threadId,
+        costUsd: info.costUsd,
+        sessionId: info.sessionId,
+      });
       const h = this.handles.get(threadId);
       if (!h) return;
       this.clearInFlightTimer(h);
@@ -724,7 +767,9 @@ export class ClaudeDaemonRegistry {
       // fine but dies every turn — bad /model, corrupt session JSONL, auth error).
       h.crashCount += 1;
       const crashThreshold = this.opts.crashLoopThreshold ?? 3;
-      if (h.crashCount === crashThreshold) this.opts.onCrashLoop?.(threadId, h.crashCount);
+      if (h.crashCount === crashThreshold) {
+        this.emitEvent({ kind: "crash-loop", threadId, crashCount: h.crashCount });
+      }
       // Schedule a respawn attempt with exponential backoff. If the queue
       // is non-empty, the respawn will flush; otherwise stays idle until
       // the next enqueue.

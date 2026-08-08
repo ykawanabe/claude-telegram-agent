@@ -55,6 +55,7 @@ import type {
   RoutingKey,
   SenderId,
   InboundEvent,
+  InboundJournal,
   AckHandle,
   TypingToken,
 } from "../types";
@@ -76,6 +77,49 @@ const READ_REACTION_EMOJI = "👌";
 
 /** Telegram plain-text message hard limit. sendText chunks above this. */
 const TG_TEXT_MAX_CHARS = 4096;
+
+/** Filesystem implementation of the platform-neutral inbound hand-off. */
+class TelegramInboundJournal implements InboundJournal<TgUpdate, number> {
+  constructor(private readonly inboxDir: string) {}
+
+  private path(updateId: number): string {
+    return join(this.inboxDir, `${updateId}.json`);
+  }
+
+  persist(update: TgUpdate): void {
+    mkdirSync(this.inboxDir, { recursive: true, mode: 0o700 });
+    const path = this.path(update.update_id);
+    const tmp = `${path}.tmp.${process.pid}`;
+    const fd = openSync(tmp, "w", 0o600);
+    try {
+      writeFileSync(fd, `${JSON.stringify(update)}\n`);
+      fsyncSync(fd);
+    } finally { closeSync(fd); }
+    renameSync(tmp, path);
+  }
+
+  listPending(): TgUpdate[] {
+    let names: string[];
+    try { names = readdirSync(this.inboxDir); } catch { return []; }
+    const updates: TgUpdate[] = [];
+    for (const name of names.filter((n) => /^\d+\.json$/.test(n)).sort((a, b) => Number(a.slice(0, -5)) - Number(b.slice(0, -5)))) {
+      const path = join(this.inboxDir, name);
+      try {
+        const update = JSON.parse(readFileSync(path, "utf8")) as TgUpdate;
+        if (!Number.isSafeInteger(update.update_id) || update.update_id < 0) throw new Error("invalid update_id");
+        updates.push(update);
+      } catch (e) {
+        process.stderr.write(`telegram: corrupt inbox record ${name}: ${e instanceof Error ? e.message : String(e)} (discarded)\n`);
+        try { unlinkSync(path); } catch { /* raced cleanup */ }
+      }
+    }
+    return updates;
+  }
+
+  remove(updateId: number): void {
+    try { unlinkSync(this.path(updateId)); } catch { /* already absent */ }
+  }
+}
 
 /** A Telegram ack handle: enough to flip the reaction later (N:1 flush). */
 interface TgAckHandle {
@@ -133,7 +177,8 @@ export class TelegramTransport
   // overlaps) + a hard cap so a loop can't spin forever if the marker is never
   // cleared. The on-disk marker also powers Pager's isGenerating.
   private readonly stateDir = stateDir();
-  private readonly inboxDir = join(this.stateDir, "inbound-inbox");
+  private readonly inboundJournal: InboundJournal<TgUpdate, number> =
+    new TelegramInboundJournal(join(this.stateDir, "inbound-inbox"));
   private readonly typingIntervalMs = Number(process.env.TYPING_INTERVAL_MS ?? "4000");
   private readonly typingMaxMs = Number(process.env.TYPING_MAX_MS ?? `${10 * 60_000}`);
   private readonly emptyPollBackoffMs = (() => {
@@ -188,7 +233,7 @@ export class TelegramTransport
         if (this.emptyPollBackoffMs > 0) await new Promise((r) => setTimeout(r, this.emptyPollBackoffMs));
         continue;
       }
-      for (const update of updates) this.persistInbox(update);
+      for (const update of updates) this.inboundJournal.persist(update);
       const maxId = Math.max(...updates.map((u) => u.update_id));
       this.writeOffset(maxId + 1);
       offset = maxId + 1;
@@ -211,42 +256,8 @@ export class TelegramTransport
     this.currentPollAbort?.abort();
   }
 
-  private inboxPath(updateId: number): string {
-    return join(this.inboxDir, `${updateId}.json`);
-  }
-
-  private persistInbox(update: TgUpdate): void {
-    mkdirSync(this.inboxDir, { recursive: true, mode: 0o700 });
-    const path = this.inboxPath(update.update_id);
-    const tmp = `${path}.tmp.${process.pid}`;
-    const fd = openSync(tmp, "w", 0o600);
-    try {
-      writeFileSync(fd, `${JSON.stringify(update)}\n`);
-      fsyncSync(fd);
-    } finally { closeSync(fd); }
-    renameSync(tmp, path);
-  }
-
-  private readInbox(): TgUpdate[] {
-    let names: string[];
-    try { names = readdirSync(this.inboxDir); } catch { return []; }
-    const updates: TgUpdate[] = [];
-    for (const name of names.filter((n) => /^\d+\.json$/.test(n)).sort((a, b) => Number(a.slice(0, -5)) - Number(b.slice(0, -5)))) {
-      const path = join(this.inboxDir, name);
-      try {
-        const update = JSON.parse(readFileSync(path, "utf8")) as TgUpdate;
-        if (!Number.isSafeInteger(update.update_id) || update.update_id < 0) throw new Error("invalid update_id");
-        updates.push(update);
-      } catch (e) {
-        process.stderr.write(`telegram: corrupt inbox record ${name}: ${e instanceof Error ? e.message : String(e)} (discarded)\n`);
-        try { unlinkSync(path); } catch { /* raced cleanup */ }
-      }
-    }
-    return updates;
-  }
-
   private async replayInbox(offset: number): Promise<number> {
-    const updates = this.readInbox();
+    const updates = this.inboundJournal.listPending();
     if (updates.length === 0) return offset;
     const recoveredOffset = Math.max(offset, Math.max(...updates.map((u) => u.update_id)) + 1);
     if (recoveredOffset !== offset) this.writeOffset(recoveredOffset);
@@ -265,7 +276,7 @@ export class TelegramTransport
         `[${new Date().toISOString()}] inbound dispatch error (update ${update.update_id}, discarded): ${e instanceof Error ? (e.stack ?? e.message) : String(e)}\n`,
       );
     }
-    try { unlinkSync(this.inboxPath(update.update_id)); } catch { /* already absent */ }
+    this.inboundJournal.remove(update.update_id);
   }
 
   async whoami(): Promise<{ id: string; username?: string; displayName?: string }> {

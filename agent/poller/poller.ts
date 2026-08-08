@@ -44,6 +44,8 @@ import {
 } from "./slash-commands";
 import { ClaudeDaemonRegistry } from "./claude-daemon-registry";
 import type { ClaudeDaemonOptions } from "./claude-daemon";
+import { parseBotCommand, type BotFeature } from "./bot-feature";
+import type { DaemonEvent, EventSink, ResourceGovernor } from "./contracts";
 import { parseButtonsMarker } from "./buttons-marker";
 import {
   type HeartbeatState,
@@ -83,7 +85,7 @@ import type {
   TgUpdate,
   TgChatMemberUpdated,
 } from "../channels/telegram/adapter";
-import { makeTransport } from "../channels/transport-factory";
+import { makeOutboundQueue, makeTransport } from "../channels/transport-factory";
 import { isButtonCapable, isEditable, isInterruptible, isReactable, isTyping, type AckHandle, type ChatAddress, type ChatTransport, type Channel, type InboundEvent } from "../channels/types";
 
 /** The normalized message-kind event the command pipeline consumes (replaces the
@@ -125,6 +127,7 @@ function chatIdOf(ev: InboundMessageEvent): number {
 // "telegram", so production is unchanged.
 const activeChannel: Channel = (process.env.CTA_CHANNEL as Channel) ?? "telegram";
 const transport: ChatTransport = makeTransport(activeChannel);
+const outboundQueue = makeOutboundQueue(transport);
 
 /** Outbound plain text. Flows through transport.sendText (which chunks >4096 and
  *  returns a ref). Takes a platform-agnostic ChatAddress — the poller no longer
@@ -132,7 +135,7 @@ const transport: ChatTransport = makeTransport(activeChannel);
  *  the identical path. Handlers pass the inbound event's `ev.address`; the few
  *  non-inbound senders (daemon stream, mount prompt) build one via `tgAddr`. */
 async function reply(to: ChatAddress, text: string): Promise<void> {
-  await transport.sendText({ to, text });
+  await outboundQueue.enqueue({ kind: "text", to, text });
 }
 
 /** Build a Telegram ChatAddress from raw ids. Transitional helper for the
@@ -829,7 +832,8 @@ function postTelegramTextFromDaemon(threadIdStr: string, text: string): void {
   // transport's ButtonCapable path. No marker → plain text as before.
   const { body, buttons } = parseButtonsMarker(text);
   if (buttons && buttons.length > 0 && isButtonCapable(transport)) {
-    void transport.sendButtons({
+    void outboundQueue.enqueue({
+      kind: "buttons",
       to: { channel: "telegram", chatId: chat_id, threadId },
       text: body || "Choose:",
       buttons,
@@ -899,6 +903,36 @@ function onDaemonTurnEnd(threadIdStr: string, info: { costUsd: number | null; se
   }
 }
 
+/** Translate registry-domain events to the poller's existing side effects.
+ * EventSink is synchronous by contract, preserving callback ordering. */
+const daemonEventSink: EventSink = {
+  emit(event: DaemonEvent): void {
+    switch (event.kind) {
+      case "text":
+        postTelegramTextFromDaemon(event.threadId, event.text);
+        return;
+      case "flush":
+        onDaemonFlush(event.threadId, event.combinedText);
+        return;
+      case "turn-start":
+        onDaemonTurnStart(event.threadId);
+        return;
+      case "turn-end":
+        onDaemonTurnEnd(event.threadId, {
+          costUsd: event.costUsd,
+          sessionId: event.sessionId,
+        });
+        return;
+      case "spawn-failed":
+        onDaemonSpawnFail(event.threadId);
+        return;
+      case "crash-loop":
+        onDaemonCrashLoop(event.threadId, event.crashCount);
+        return;
+    }
+  },
+};
+
 /** Initialize the daemon registry. Called once in main(). */
 function initDaemonRegistry(): void {
   if (daemonRegistry) return;
@@ -926,12 +960,7 @@ function initDaemonRegistry(): void {
     // wedge). Without this, the only recovery was the 5-min inFlight watchdog →
     // 5 min of silence. 12s SIGKILLs + respawns + flushes the steer instead.
     interruptEscalateMs: Number(process.env.PAGER_INTERRUPT_ESCALATE_MS ?? "12000"),
-    onText: postTelegramTextFromDaemon,
-    onFlush: onDaemonFlush,
-    onTurnStart: onDaemonTurnStart,
-    onTurnEnd: onDaemonTurnEnd,
-    onSpawnFail: onDaemonSpawnFail,
-    onCrashLoop: onDaemonCrashLoop,
+    eventSink: daemonEventSink,
   });
 }
 
@@ -1473,6 +1502,41 @@ async function idleFlushAndClear(threadIdStr: string): Promise<void> {
     idleFlushing.delete(threadIdStr);
   }
 }
+
+/** One resource-governance pass, extracted verbatim from the housekeeping
+ * timer. Candidate selection, ordering, detached large-session flushes and the
+ * soft idle-only warm cap intentionally retain their current semantics. */
+async function sweepResources(): Promise<void> {
+  // Idle sweep (opt-in): large transcript → detached flush + clear; small or
+  // missing transcript → evict only while preserving the session UUID.
+  if (daemonRegistry && idleEvictMinutes > 0) {
+    for (const threadIdStr of daemonRegistry.idleCandidates(idleEvictMinutes * 60_000)) {
+      if (idleFlushing.has(threadIdStr)) continue;
+      const key: number | "dm" = threadIdStr === "dm" ? "dm" : Number(threadIdStr);
+      const mount = mountsCache.get(tgKey(key));
+      const jsonl = mount ? jsonlPathForMount(mount) : null;
+      let bytes = 0;
+      if (jsonl) { try { bytes = statSync(jsonl).size; } catch { /* missing → 0 */ } }
+      if (bytes > IDLE_CLEAR_MIN_BYTES) {
+        void idleFlushAndClear(threadIdStr);
+      } else {
+        await daemonRegistry.resetTopic(threadIdStr);
+        process.stdout.write(`[${new Date().toISOString()}] evicted idle daemon ${threadIdStr} after ${idleEvictMinutes}m (session ${bytes}B ≤ ${IDLE_CLEAR_MIN_BYTES}B)\n`);
+      }
+    }
+  }
+
+  // Independent warm-process cap. Busy work is never selected, so this is a
+  // soft cap when every excess daemon is active.
+  if (daemonRegistry && MAX_WARM_DAEMONS > 0) {
+    for (const threadIdStr of daemonRegistry.overCapacityIdleCandidates(MAX_WARM_DAEMONS)) {
+      await daemonRegistry.resetTopic(threadIdStr);
+      process.stdout.write(`[${new Date().toISOString()}] evicted idle daemon ${threadIdStr} to enforce max_warm_daemons=${MAX_WARM_DAEMONS}\n`);
+    }
+  }
+}
+
+const resourceGovernor: ResourceGovernor = { sweep: sweepResources };
 
 // /clear over Telegram: rotate the per-topic session UUID and kill the
 // topic's tmux session. The watchdog (kick_dead_topic_sessions) and the
@@ -2072,6 +2136,26 @@ async function handleHiddenTuiCommand(ev: InboundMessageEvent, command: string, 
   );
 }
 
+/** Existing translated/hidden Claude TUI command table behind the BotFeature
+ * consumption contract. Bootstrap, authorization and direct bot commands stay
+ * in the outer dispatcher because their priority is security-sensitive. */
+const tuiBotFeature: BotFeature<InboundMessageEvent> = {
+  id: "claude-tui-commands",
+  commands: Object.keys(TUI_COMMANDS),
+  async tryHandle({ event, command }): Promise<boolean> {
+    const spec = TUI_COMMANDS[command];
+    if (spec?.disposition === "translated") {
+      await spec.handler(event);
+      return true;
+    }
+    if (spec?.disposition === "hidden") {
+      await handleHiddenTuiCommand(event, command, spec.reason);
+      return true;
+    }
+    return false;
+  },
+};
+
 /**
  * Attempt to handle a message as an in-chat command. Returns true if the
  * message was consumed by command handling (so normal tmux dispatch should
@@ -2084,13 +2168,9 @@ async function handleHiddenTuiCommand(ev: InboundMessageEvent, command: string, 
  * except for the blocklist of UI-only built-ins.
  */
 async function tryHandleCommand(ev: InboundMessageEvent): Promise<boolean> {
-  const text = ev.text;
-  if (!text.startsWith("/")) return false;
-  // `/pair@MyBot AB7K-...` → strip @-suffix from command word
-  const firstSpace = text.indexOf(" ");
-  const head = firstSpace < 0 ? text : text.slice(0, firstSpace);
-  const command = head.split("@")[0].toLowerCase();
-  const args = firstSpace < 0 ? "" : text.slice(firstSpace + 1);
+  const parsed = parseBotCommand(ev.text);
+  if (!parsed) return false;
+  const { command, args } = parsed;
 
   // Pre-pair: only /start and /pair are meaningful. Everything else falls
   // through (which then drops because there is no paired authorization yet).
@@ -2126,20 +2206,10 @@ async function tryHandleCommand(ev: InboundMessageEvent): Promise<boolean> {
     case "/do":    await handleDo(ev, args); return true;
     case "/task":  await handleTask(ev, args); return true;
     case "/help":  await handleHelp(ev); return true;
-    default: {
-      // TUI command framework: translated → run handler, hidden → reply,
-      // forwarded (no entry) → fall through to claude.
-      const spec = TUI_COMMANDS[command];
-      if (spec?.disposition === "translated") {
-        await spec.handler(ev);
-        return true;
-      }
-      if (spec?.disposition === "hidden") {
-        await handleHiddenTuiCommand(ev, command, spec.reason);
-        return true;
-      }
-      return false; // unknown /x → let claude see it (user skills etc.)
-    }
+    default:
+      // TUI translated/hidden commands consume; unknown /x falls through to
+      // claude so user-defined skills keep working.
+      return tuiBotFeature.tryHandle({ event: ev, command, args });
   }
 }
 
@@ -3044,38 +3114,7 @@ export async function main(): Promise<void> {
           lastFileAccessProbe = Date.now();
           runFileAccessProbe(STATE_DIR);
         }
-        // Idle sweep (opt-in): for each topic quiet ≥ N min, decide by size.
-        // Large transcript → flush durable memory then clear (rotate UUID →
-        // fresh, cheap session); the flush runs DETACHED so a slow turn never
-        // stalls this tick. Small transcript → evict only (resetTopic keeps the
-        // UUID → next message --resumes, RAM reclaim, no context loss).
-        // No-op unless the operator set a threshold.
-        if (daemonRegistry && idleEvictMinutes > 0) {
-          for (const threadIdStr of daemonRegistry.idleCandidates(idleEvictMinutes * 60_000)) {
-            if (idleFlushing.has(threadIdStr)) continue;
-            const key: number | "dm" = threadIdStr === "dm" ? "dm" : Number(threadIdStr);
-            const mount = mountsCache.get(tgKey(key));
-            const jsonl = mount ? jsonlPathForMount(mount) : null;
-            let bytes = 0;
-            if (jsonl) { try { bytes = statSync(jsonl).size; } catch { /* missing → 0 */ } }
-            if (bytes > IDLE_CLEAR_MIN_BYTES) {
-              void idleFlushAndClear(threadIdStr); // detached — must not block the tick
-            } else {
-              await daemonRegistry.resetTopic(threadIdStr);
-              process.stdout.write(`[${new Date().toISOString()}] evicted idle daemon ${threadIdStr} after ${idleEvictMinutes}m (session ${bytes}B ≤ ${IDLE_CLEAR_MIN_BYTES}B)\n`);
-            }
-          }
-        }
-        // Independent warm-process cap: even active use across several topics
-        // should not leave an unbounded number of ~500 MB claude processes
-        // resident. Evict oldest idle topics only; resetTopic preserves their
-        // UUID, so the next message resumes the same conversation.
-        if (daemonRegistry && MAX_WARM_DAEMONS > 0) {
-          for (const threadIdStr of daemonRegistry.overCapacityIdleCandidates(MAX_WARM_DAEMONS)) {
-            await daemonRegistry.resetTopic(threadIdStr);
-            process.stdout.write(`[${new Date().toISOString()}] evicted idle daemon ${threadIdStr} to enforce max_warm_daemons=${MAX_WARM_DAEMONS}\n`);
-          }
-        }
+        await resourceGovernor.sweep();
         // β handoff release/reacquire flags + watch-live inject. fs.watch
         // handles immediacy; this is the steady-state fallback drain.
         await processReleaseFlags();

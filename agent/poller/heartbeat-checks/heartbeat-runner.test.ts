@@ -109,6 +109,23 @@ describe("parseStreamJson", () => {
     expect(r.assistantText).toBe("");
     expect(r.totalCostUsd).toBe(0);
   });
+
+  test("parses an unterminated EOF tail and concatenates text blocks in order", () => {
+    const assistant = JSON.stringify({
+      type: "assistant",
+      message: { content: [
+        { type: "text", text: "one " },
+        { type: "thinking", text: "hidden" },
+        { type: "text", text: "two" },
+      ] },
+    });
+    const result = JSON.stringify({ type: "result", total_cost_usd: 0.2 });
+
+    expect(parseStreamJson(`${assistant}\n${result}`)).toEqual({
+      assistantText: "one two",
+      totalCostUsd: 0.2,
+    });
+  });
 });
 
 // buildClaudeArgv — Design A invariants ──────────────────────────────────────
