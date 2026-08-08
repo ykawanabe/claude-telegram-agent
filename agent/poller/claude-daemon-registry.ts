@@ -434,6 +434,29 @@ export class ClaudeDaemonRegistry {
     return out;
   }
 
+  /** Return the oldest quiescent daemons that may be evicted to bring the
+   *  warm-daemon count down to maxWarm. This is deliberately PURE: the poller
+   *  performs the resets and logs them. Busy, queued, released, and crashed
+   *  topics are never candidates, so capacity pressure cannot interrupt work.
+   *  maxWarm <= 0 disables the cap. */
+  overCapacityIdleCandidates(maxWarm: number): string[] {
+    if (maxWarm <= 0) return [];
+
+    let liveCount = 0;
+    const idle: Array<{ threadId: string; lastActivityAt: number }> = [];
+    for (const [threadId, h] of this.handles) {
+      if (!h.daemon || !h.daemon.isAlive) continue;
+      liveCount += 1;
+      if (h.state !== "idle" || h.queue.length > 0) continue;
+      idle.push({ threadId, lastActivityAt: h.lastActivityAt });
+    }
+
+    const overflow = liveCount - Math.floor(maxWarm);
+    if (overflow <= 0) return [];
+    idle.sort((a, b) => a.lastActivityAt - b.lastActivityAt);
+    return idle.slice(0, overflow).map(({ threadId }) => threadId);
+  }
+
   /** True iff the topic is currently idle with an empty queue — the "still safe
    *  to clear?" check the idle sweep runs AFTER a memory-flush turn, so a real
    *  message that arrived mid-flush (→ pending/queued) aborts the clear. */

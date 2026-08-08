@@ -166,7 +166,6 @@ import { runFileAccessProbe } from "./file-access-probe";
 // a real bot token. Tests override CTA_STATE_DIR to redirect state files
 // and TELEGRAM_API_BASE to route outbound calls at a mock server.
 
-const ENV_MAIN_CHAT_ID = process.env.MAIN_CHAT_ID; // optional Phase 2 override
 const POLL_TIMEOUT_SEC = Number(process.env.POLL_TIMEOUT_SEC ?? "25");
 
 const STATE_DIR = stateDir();
@@ -229,11 +228,11 @@ function touchHeartbeat(): void {
 }
 
 // ─── paired state ────────────────────────────────────────────────────────────
-// Phase 3 zero-config onboarding: instead of MAIN_CHAT_ID in .env, the user
-// pairs the bot in-chat by sending `/pair <code>`. The poller writes the
-// resulting chat_id + user_id to paired.json. MAIN_CHAT_ID env (Phase 2
-// holdover) is honored as a fallback for users upgrading from the manual
-// flow — paired.json wins if both exist.
+// Phase 3 zero-config onboarding: the user pairs the bot in-chat by sending
+// `/pair <code>`. The poller writes BOTH chat_id + user_id to paired.json.
+// A legacy MAIN_CHAT_ID is deliberately ignored: chat-only authorization lets
+// every member of that group drive the host, so inbound dispatch fails closed
+// until a complete paired.json exists.
 
 interface PairedState {
   version: 1;
@@ -247,9 +246,12 @@ let pairedCache: PairedState | null = null;
 let pairedMtimeMs = 0;
 
 // Idle-daemon-eviction threshold (minutes; 0 = disabled), live-reloaded from
-// settings.json each poll loop. 0 unless the operator opts in via
-// `cta config idle-evict <min>` (the Pager "Memory" toggle).
-let idleEvictMinutes = 0;
+// settings.json each poll loop. Default 15 minutes: a warm claude process is
+// roughly 500 MB on a typical session, so leaving every visited topic resident
+// indefinitely is a poor default. Operators can still disable it explicitly
+// with `cta config idle-evict 0` (the Pager "Memory" toggle).
+const DEFAULT_IDLE_EVICT_MINUTES = 15;
+let idleEvictMinutes = DEFAULT_IDLE_EVICT_MINUTES;
 // Mid-turn auto-steer: when a message arrives during an in-flight turn, the
 // registry debounces then gracefully interrupts so the batched messages flow
 // into the next turn. Default ON; operator opt-out via
@@ -302,6 +304,14 @@ const IDLE_FLUSH_TIMEOUT_MS = ((): number => {
   const n = Number(process.env.IDLE_FLUSH_TIMEOUT_MS);
   return Number.isFinite(n) && n > 0 ? n : 3 * 60_000; // malformed/unset env → default
 })();
+// Bound the aggregate RAM held by quiet topic daemons. 0 disables this
+// capacity cap; unset/malformed defaults to two warm daemons. Capacity eviction
+// only targets idle+empty topics and preserves their session UUID for resume.
+const MAX_WARM_DAEMONS = ((): number => {
+  if (process.env.MAX_WARM_DAEMONS == null) return 2;
+  const n = Number(process.env.MAX_WARM_DAEMONS);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 2;
+})();
 // Topics with an in-flight idle flush, so the sweep doesn't launch a second.
 const idleFlushing = new Set<string>();
 // Epoch ms of the last file-access (FDA) probe; throttles re-probing to ~60s.
@@ -318,11 +328,23 @@ function refreshPairedIfChanged(): void {
       const raw = readFileSync(PAIRED_STATE_FILE, "utf8");
       const parsed = JSON.parse(raw) as PairedState;
       if (parsed.version !== 1) throw new Error("paired.json: unknown version");
+      if (!Number.isSafeInteger(parsed.chat_id)) throw new Error("paired.json: invalid chat_id");
+      if (!Number.isSafeInteger(parsed.user_id) || parsed.user_id <= 0) {
+        throw new Error("paired.json: invalid user_id");
+      }
+      if (typeof parsed.paired_at !== "string" || parsed.paired_at.length === 0) {
+        throw new Error("paired.json: invalid paired_at");
+      }
       pairedCache = parsed;
     }
     pairedMtimeMs = mtimeMs;
     process.stdout.write(`[${new Date().toISOString()}] paired state reloaded (${pairedCache ? `chat=${pairedCache.chat_id} user=${pairedCache.user_id}` : "unpaired"})\n`);
   } catch (e) {
+    // Authorization state is security-sensitive. A corrupt/truncated/legacy
+    // file must not retain an earlier permissive cache or degrade to chat-only
+    // routing. Mark this mtime handled and remain unpaired until it is fixed.
+    pairedCache = null;
+    pairedMtimeMs = mtimeMs;
     process.stderr.write(`poller: paired.json reload failed: ${e instanceof Error ? e.message : String(e)}\n`);
   }
 }
@@ -338,7 +360,7 @@ function refreshSettingsIfChanged(): void {
   try { mtimeMs = statSync(SETTINGS_FILE).mtimeMs; } catch { /* missing → disabled below */ }
   if (mtimeMs === settingsMtimeMs) return;
   try {
-    let next = 0;
+    let next = DEFAULT_IDLE_EVICT_MINUTES;
     if (mtimeMs !== 0) {
       const raw = readFileSync(SETTINGS_FILE, "utf8");
       const parsed = JSON.parse(raw) as {
@@ -352,8 +374,8 @@ function refreshSettingsIfChanged(): void {
         agenticEffort?: string;
       };
       if (parsed.version !== 1) throw new Error("settings.json: unknown version");
-      const n = Number(parsed.idle_evict_minutes ?? 0);
-      next = Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
+      const n = Number(parsed.idle_evict_minutes ?? DEFAULT_IDLE_EVICT_MINUTES);
+      next = Number.isFinite(n) && n >= 0 ? Math.floor(n) : DEFAULT_IDLE_EVICT_MINUTES;
       const steer = parsed.interrupt_on_message;
       if (typeof steer === "boolean" && steer !== interruptOnMessage) {
         interruptOnMessage = steer;
@@ -415,13 +437,17 @@ function writePairedAtomic(state: PairedState): void {
 }
 
 function effectiveChatId(): string | null {
-  if (pairedCache) return String(pairedCache.chat_id);
-  if (ENV_MAIN_CHAT_ID) return ENV_MAIN_CHAT_ID;
-  return null;
+  return pairedCache ? String(pairedCache.chat_id) : null;
 }
 
 function effectiveUserId(): number | null {
   return pairedCache?.user_id ?? null;
+}
+
+function isAuthorizedInbound(ev: InboundMessageEvent | ButtonPressEvent): boolean {
+  if (!pairedCache || ev.address.channel !== "telegram") return false;
+  return ev.address.chatId === pairedCache.chat_id
+    && ev.from.id === String(pairedCache.user_id);
 }
 
 // ─── outbound reply ──────────────────────────────────────────────────────────
@@ -1214,7 +1240,7 @@ export async function onButtonPress(ev: ButtonPressEvent): Promise<void> {
   const data = ev.label;
   const dest = ev.address;
   if (!data) { await answerCallback(cb.id); return; }
-  const isPairedUser = !!pairedCache && ev.from.id === String(pairedCache.user_id);
+  const isPairedUser = isAuthorizedInbound(ev);
 
   // Inline-keyboard answer to a buttons-marker prompt. callback_data shape:
   // `ans:<thread_id>:<label>`. We synthesize a normalized message event carrying
@@ -2052,7 +2078,7 @@ async function handleHiddenTuiCommand(ev: InboundMessageEvent, command: string, 
  * be skipped). Returns false to fall through to normal routing.
  *
  * Pre-pair: only /pair is accepted from any chat. Everything else returns
- * false (which then drops because there's no MAIN_CHAT_ID yet).
+ * false (which then drops because the bot is not paired yet).
  * Post-pair: only the paired user_id gets commands honored; others fall
  * through. Unknown /commands also fall through (claude can handle them)
  * except for the blocklist of UI-only built-ins.
@@ -2067,16 +2093,21 @@ async function tryHandleCommand(ev: InboundMessageEvent): Promise<boolean> {
   const args = firstSpace < 0 ? "" : text.slice(firstSpace + 1);
 
   // Pre-pair: only /start and /pair are meaningful. Everything else falls
-  // through (which then drops because there's no MAIN_CHAT_ID yet).
-  if (!pairedCache && !ENV_MAIN_CHAT_ID) {
+  // through (which then drops because there is no paired authorization yet).
+  if (!pairedCache) {
     if (command === "/pair") { await handlePair(ev, args); return true; }
     if (command === "/start") { await handleStart(ev); return true; }
     return false;
   }
 
-  // Post-pair authorization: paired user_id only. ev.from.id is the stringified
-  // sender id; the stored user_id is numeric, so compare as strings.
-  if (pairedCache && ev.from.id !== String(pairedCache.user_id)) {
+  // The paired operator may move the bot to a new chat with `/pair`; user_id is
+  // the durable identity for that one command. Every other command requires the
+  // current chat_id and user_id together.
+  if (command === "/pair" && ev.from.id === String(pairedCache.user_id)) {
+    await handlePair(ev, args);
+    return true;
+  }
+  if (!isAuthorizedInbound(ev)) {
     // Silently drop — don't reveal command surface to unauthorized users.
     return command.startsWith("/"); // claim handled to suppress claude dispatch
   }
@@ -2146,8 +2177,8 @@ function refreshMountsIfChanged(): void {
  *   - forum topic → mount with thread_id == msg.message_thread_id
  *   - DM (no thread_id) → mount with thread_id == "dm"
  *
- * Chat-level allowlist (MAIN_CHAT_ID) is enforced first — replaces the
- * official plugin's allowFrom semantics in v0.
+ * paired.json's chat_id AND user_id are enforced together. There is no
+ * chat-only fallback because a group chat id is not an identity boundary.
  */
 /**
  * Persist a wildcard-derived mount for a thread_id that hit the `*` template.
@@ -2186,7 +2217,7 @@ async function routeMessage(ev: InboundMessageEvent): Promise<string | null> {
     process.stderr.write(`poller: drop msg from chat=${chatId} user=${fromId} thread=${threadLabel} text=${JSON.stringify(ev.text.slice(0, 40))} reason=${reason}\n`);
   const expectedChat = effectiveChatId();
   if (expectedChat == null) {
-    dropLog("unpaired-no-env");
+    dropLog("unpaired");
     return null;
   }
   if (String(chatId) !== expectedChat) {
@@ -2197,7 +2228,7 @@ async function routeMessage(ev: InboundMessageEvent): Promise<string | null> {
   // claude. effectiveUserId is numeric; ev.from.id is stringified — compare as
   // strings.
   const expectedUser = effectiveUserId();
-  if (expectedUser != null && fromId !== String(expectedUser)) {
+  if (expectedUser == null || fromId !== String(expectedUser)) {
     dropLog(`wrong-user (expected ${expectedUser})`);
     return null;
   }
@@ -2269,7 +2300,7 @@ async function onInboundMessage(ev: InboundMessageEvent): Promise<void> {
   // as the gate decision and stop — don't route it to the daemon. Only the paired
   // user can drive an edit (mirrors tryHandleCommand's gate).
   if (pendingAgenticEdit && ev.text && !ev.text.startsWith("/")
-      && (!pairedCache || ev.from.id === String(pairedCache.user_id))) {
+      && isAuthorizedInbound(ev)) {
     const pe = pendingAgenticEdit;
     if (Date.now() > pe.expiresAt) {
       pendingAgenticEdit = null; // stale → fall through to normal handling
@@ -2282,7 +2313,7 @@ async function onInboundMessage(ev: InboundMessageEvent): Promise<void> {
     }
   }
 
-  // Commands run first. Pre-pair /pair messages bypass MAIN_CHAT_ID gating
+  // Commands run first. Pre-pair /pair messages bypass paired-state gating
   // (that's the whole point — we don't know the chat yet). Post-pair commands
   // are gated by paired user_id inside tryHandleCommand.
   if (await tryHandleCommand(ev)) return;
@@ -2302,7 +2333,7 @@ async function onInboundMessage(ev: InboundMessageEvent): Promise<void> {
     return;
   }
   const expectedUser = effectiveUserId();
-  if (expectedUser != null && ev.from.id !== String(expectedUser)) {
+  if (expectedUser == null || ev.from.id !== String(expectedUser)) {
     void routeMessage(ev);
     return;
   }
@@ -2965,6 +2996,10 @@ export async function main(): Promise<void> {
 
   const startupChat = effectiveChatId() ?? "(unpaired — awaiting /pair)";
   process.stdout.write(`[${new Date().toISOString()}] poller starting (Phase 4 daemon mode), offset=${offset}, chat=${startupChat}, mounts=${mountsCache.size}\n`);
+  // Seed liveness once at boot. Subsequent touches come only from successful
+  // transport reads, so a wedged inbound socket eventually goes stale and the
+  // watchdog can restart the process.
+  touchHeartbeat();
 
   // ── Housekeeping off the poll cadence ──────────────────────────────────────
   // P3a: transport.start() below owns the inbound long-poll loop (it blocks on
@@ -2991,7 +3026,6 @@ export async function main(): Promise<void> {
             process.stdout.write(`[${new Date().toISOString()}] wake-flag observed → forced inbound retry\n`);
           }
         }
-        touchHeartbeat();
         refreshMountsIfChanged();
         refreshPairedIfChanged();
         refreshSettingsIfChanged();
@@ -3032,6 +3066,16 @@ export async function main(): Promise<void> {
             }
           }
         }
+        // Independent warm-process cap: even active use across several topics
+        // should not leave an unbounded number of ~500 MB claude processes
+        // resident. Evict oldest idle topics only; resetTopic preserves their
+        // UUID, so the next message resumes the same conversation.
+        if (daemonRegistry && MAX_WARM_DAEMONS > 0) {
+          for (const threadIdStr of daemonRegistry.overCapacityIdleCandidates(MAX_WARM_DAEMONS)) {
+            await daemonRegistry.resetTopic(threadIdStr);
+            process.stdout.write(`[${new Date().toISOString()}] evicted idle daemon ${threadIdStr} to enforce max_warm_daemons=${MAX_WARM_DAEMONS}\n`);
+          }
+        }
         // β handoff release/reacquire flags + watch-live inject. fs.watch
         // handles immediacy; this is the steady-state fallback drain.
         await processReleaseFlags();
@@ -3057,6 +3101,9 @@ export async function main(): Promise<void> {
     switch (ev.kind) {
       case "transport-degraded":
         process.stderr.write(`poller: transport degraded: ${ev.reason}\n`);
+        return;
+      case "transport-progress":
+        touchHeartbeat();
         return;
       case "topic-created":
       case "topic-renamed":
@@ -3104,6 +3151,8 @@ export {
   refreshMountsIfChanged,
   effectiveChatId,
   effectiveUserId,
+  isAuthorizedInbound,
+  routeMessage,
   effortArg,
   type TgMessage,
   type InboundMessageEvent,

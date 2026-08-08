@@ -4,7 +4,7 @@
 # Two launchd jobs, no terminal multiplexer:
 #   com.claude-agent     → start_agents.sh → exec bun poller.ts (KeepAlive on
 #                          crash; clean stop leaves it down)
-#   com.claude-watchdog  → watch_network.sh (always KeepAlive; kickstarts the
+#   com.claude-watchdog  → watch_network.sh (KeepAlive on crash; kickstarts the
 #                          agent job on a stale heartbeat)
 #
 # Validates the plist templates + that install-time sed substitution leaves no
@@ -36,17 +36,17 @@ agent_body="$(cat "$AGENT_TPL" 2>/dev/null || true)"
 [[ "$agent_body" == *"__STATE_DIR__/agent.log"* ]] \
   && ok "agent: StandardOutPath → agent.log" || ng "agent: StandardOutPath → agent.log"
 
-# ─── watchdog plist: own job, always-on supervision ─────────────────────────
+# ─── watchdog plist: own job, crash-only supervision ────────────────────────
 wd_body="$(cat "$WATCHDOG_TPL" 2>/dev/null || true)"
 [[ "$wd_body" == *"<string>com.claude-watchdog</string>"* ]] \
   && ok "watchdog: Label com.claude-watchdog" || ng "watchdog: Label com.claude-watchdog"
 [[ "$wd_body" == *"__BIN_DIR__/watch_network.sh"* ]] \
   && ok "watchdog: ProgramArguments → watch_network.sh" || ng "watchdog: ProgramArguments → watch_network.sh"
-# Unconditional KeepAlive: <key>KeepAlive</key> immediately followed by <true/>.
-if printf '%s' "$wd_body" | tr -d ' \n' | grep -q '<key>KeepAlive</key><true/>'; then
-  ok "watchdog: unconditional KeepAlive"
+# Crash-only KeepAlive: intentional `cta stop` exits cleanly and stays down.
+if [[ "$wd_body" == *"<key>KeepAlive</key>"* && "$wd_body" == *"<key>SuccessfulExit</key>"* ]]; then
+  ok "watchdog: KeepAlive on unsuccessful exit only"
 else
-  ng "watchdog: expected unconditional KeepAlive (<key>KeepAlive</key><true/>)"
+  ng "watchdog: expected KeepAlive SuccessfulExit=false"
 fi
 
 # ─── neither plist references a terminal multiplexer ─────────────────────────

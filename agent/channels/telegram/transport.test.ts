@@ -7,7 +7,7 @@
  * interfaces it advertises (compile-time assignment + runtime type guards).
  */
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -307,6 +307,47 @@ describe("start/onEvent long-poll loop", () => {
     await t.stop();
     await loop;
     expect(got).toContain("from-loop");
+  });
+
+  test("persists an update before dispatch and removes it after success", async () => {
+    const t = new TelegramTransport();
+    const inboxPath = join(STATE, "inbound-inbox", "150.json");
+    let existedDuringDispatch = false;
+    let resolveFirst: () => void;
+    const first = new Promise<void>((r) => (resolveFirst = r));
+    t.onEvent(async (e) => {
+      if (e.kind !== "message") return;
+      existedDuringDispatch = existsSync(inboxPath);
+      resolveFirst();
+    });
+    updateQueue = [{ update_id: 150, message: { message_id: 2, from: { id: 99 }, chat: { id: -100 }, text: "durable" } }];
+    const loop = t.start({});
+    await Promise.race([first, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 4000))]);
+    await t.stop();
+    await loop;
+    expect(existedDuringDispatch).toBe(true);
+    expect(existsSync(inboxPath)).toBe(false);
+  });
+
+  test("replays a durable inbox record before polling", async () => {
+    const inboxDir = join(STATE, "inbound-inbox");
+    mkdirSync(inboxDir, { recursive: true });
+    writeFileSync(join(inboxDir, "200.json"), JSON.stringify({
+      update_id: 200,
+      message: { message_id: 3, from: { id: 99 }, chat: { id: -100 }, text: "recovered" },
+    }));
+    const t = new TelegramTransport();
+    const got: string[] = [];
+    t.onEvent(async (e) => {
+      if (e.kind === "message") {
+        got.push(e.text);
+        await t.stop();
+      }
+    });
+    await t.start({});
+    expect(got).toEqual(["recovered"]);
+    expect(existsSync(join(inboxDir, "200.json"))).toBe(false);
+    expect(Number(readFileSync(join(STATE, "poller-offset"), "utf8").trim())).toBeGreaterThanOrEqual(201);
   });
 });
 

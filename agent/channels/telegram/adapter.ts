@@ -36,6 +36,11 @@ export function getApiBase(): string {
   return process.env.TELEGRAM_API_BASE ?? `https://api.telegram.org/bot${token}`;
 }
 
+function outboundTimeoutMs(): number {
+  const n = Number(process.env.TELEGRAM_REQUEST_TIMEOUT_MS ?? "15000");
+  return Number.isFinite(n) && n > 0 ? n : 15_000;
+}
+
 /**
  * Send plain text to a chat (and optional forum topic). Best-effort: a failed
  * send is logged, never thrown — the poller's hot path must not unwind on a
@@ -48,7 +53,7 @@ export async function sendText(
   const body: Record<string, unknown> = { chat_id: target.chat_id, text };
   if (target.thread_id != null) body.message_thread_id = target.thread_id;
   try {
-    const resp = await fetch(`${getApiBase()}/sendMessage`, {
+    const resp = await fetchWithTimeout(`${getApiBase()}/sendMessage`, outboundTimeoutMs(), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -72,7 +77,7 @@ export async function sendText(
  */
 export async function setReaction(chat_id: number, message_id: number, emoji: string): Promise<void> {
   try {
-    await fetch(`${getApiBase()}/setMessageReaction`, {
+    await fetchWithTimeout(`${getApiBase()}/setMessageReaction`, outboundTimeoutMs(), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -94,7 +99,7 @@ export async function sendChatAction(chat_id: number, thread_id?: number): Promi
   const body: Record<string, unknown> = { chat_id, action: "typing" };
   if (thread_id != null) body.message_thread_id = thread_id;
   try {
-    await fetch(`${getApiBase()}/sendChatAction`, {
+    await fetchWithTimeout(`${getApiBase()}/sendChatAction`, outboundTimeoutMs(), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -142,7 +147,7 @@ export async function editMessageText(
   text: string,
 ): Promise<void> {
   try {
-    await fetch(`${getApiBase()}/editMessageText`, {
+    await fetchWithTimeout(`${getApiBase()}/editMessageText`, outboundTimeoutMs(), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id, message_id, text }),
@@ -169,7 +174,7 @@ export async function sendInlineKeyboard(
     // instead of the topic. (mcp-telegram set this from THREAD_ID; P4 moves
     // that responsibility into the transport.)
     if (thread_id != null) body.message_thread_id = thread_id;
-    const resp = await fetch(`${getApiBase()}/sendMessage`, {
+    const resp = await fetchWithTimeout(`${getApiBase()}/sendMessage`, outboundTimeoutMs(), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -192,7 +197,7 @@ export async function sendInlineKeyboard(
  */
 export async function answerCallback(callback_query_id: string, text?: string, alert?: boolean): Promise<void> {
   try {
-    await fetch(`${getApiBase()}/answerCallbackQuery`, {
+    await fetchWithTimeout(`${getApiBase()}/answerCallbackQuery`, outboundTimeoutMs(), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ callback_query_id, text, show_alert: alert ?? false }),
@@ -254,8 +259,8 @@ export interface TgResp { ok: boolean; result?: TgUpdate[]; description?: string
  * wedges the poll loop — alive but stuck, heartbeat frozen. AbortController
  * bounds it so the call throws and the loop's retry path recovers.
  *
- * Generic (not Telegram-specific) but colocated with its only consumers
- * (getUpdates/getMe); promote to a shared lib if another transport needs it.
+ * Generic (not Telegram-specific) and used by every inbound/outbound Bot API
+ * request so a half-open socket cannot wedge dispatch or typing forever.
  */
 export async function fetchWithTimeout(
   url: string,

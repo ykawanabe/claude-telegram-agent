@@ -453,6 +453,52 @@ describe("ClaudeDaemonRegistry idleCandidates", () => {
   });
 });
 
+describe("ClaudeDaemonRegistry overCapacityIdleCandidates", () => {
+  let reg: ClaudeDaemonRegistry | null = null;
+  afterEach(async () => { if (reg) { await reg.shutdown(); reg = null; } });
+
+  async function spawnIdle(r: ClaudeDaemonRegistry, thread: string): Promise<void> {
+    r.enqueue(thread, "hello");
+    await waitFor(() => r.getStatus(thread) === "idle", 5000);
+  }
+
+  test("returns the oldest idle daemon needed to satisfy the cap", async () => {
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 20,
+      daemonOptsFor: () => ({ cwd: "/tmp" }),
+      onText: () => {},
+    });
+    await spawnIdle(reg, "oldest");
+    await new Promise((r) => setTimeout(r, 10));
+    await spawnIdle(reg, "middle");
+    await new Promise((r) => setTimeout(r, 10));
+    await spawnIdle(reg, "newest");
+
+    expect(reg.daemonCount).toBe(3);
+    expect(reg.overCapacityIdleCandidates(2)).toEqual(["oldest"]);
+    expect(reg.overCapacityIdleCandidates(1)).toEqual(["oldest", "middle"]);
+  });
+
+  test("never returns busy work and maxWarm <= 0 disables the cap", async () => {
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 20,
+      daemonOptsFor: (thread) => ({
+        cwd: "/tmp",
+        env: thread === "busy" ? { FAKE_CLAUDE_MODE: "hang-no-result" } : undefined,
+      }),
+      onText: () => {},
+    });
+    await spawnIdle(reg, "idle");
+    reg.enqueue("busy", "work");
+    await waitFor(() => reg!.getStatus("busy") === "inFlight", 5000);
+
+    expect(reg.overCapacityIdleCandidates(1)).toEqual(["idle"]);
+    expect(reg.overCapacityIdleCandidates(0)).toEqual([]);
+  });
+});
+
 describe("ClaudeDaemonRegistry isIdleEmpty", () => {
   let reg: ClaudeDaemonRegistry | null = null;
   afterEach(async () => { if (reg) { await reg.shutdown(); reg = null; } });

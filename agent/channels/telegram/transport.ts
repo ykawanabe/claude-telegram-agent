@@ -26,7 +26,7 @@
  * = what this adapter version has wired. The two axes are intentionally distinct.
  */
 
-import { openSync, closeSync, writeFileSync, fsyncSync, renameSync, readFileSync } from "node:fs";
+import { openSync, closeSync, writeFileSync, fsyncSync, renameSync, readFileSync, mkdirSync, readdirSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
@@ -133,8 +133,13 @@ export class TelegramTransport
   // overlaps) + a hard cap so a loop can't spin forever if the marker is never
   // cleared. The on-disk marker also powers Pager's isGenerating.
   private readonly stateDir = stateDir();
+  private readonly inboxDir = join(this.stateDir, "inbound-inbox");
   private readonly typingIntervalMs = Number(process.env.TYPING_INTERVAL_MS ?? "4000");
   private readonly typingMaxMs = Number(process.env.TYPING_MAX_MS ?? `${10 * 60_000}`);
+  private readonly emptyPollBackoffMs = (() => {
+    const n = Number(process.env.EMPTY_POLL_BACKOFF_MS ?? "100");
+    return Number.isFinite(n) && n >= 0 ? n : 100;
+  })();
 
   private handler: ((e: InboundEvent) => Promise<void>) | null = null;
   private running = false;
@@ -150,13 +155,15 @@ export class TelegramTransport
     this.handler = handler;
   }
 
-  /** Drive the long-poll loop: getUpdates → persist offset BEFORE dispatch
-   *  (drop-not-double-deliver durability contract) → normalize → handler.
+  /** Drive the long-poll loop: getUpdates → durable inbox → advance offset →
+   *  normalize/dispatch → delete inbox record. Persisting work before the
+   *  offset prevents a crash from silently dropping an already-confirmed batch.
    *  Each iteration carries its own AbortController so external code
    *  (poller's wake-flag housekeep) can abort the in-flight fetch. */
   async start(_opts: { publicUrl?: string }): Promise<void> {
     this.running = true;
     let offset = this.readOffset();
+    offset = await this.replayInbox(offset);
     while (this.running) {
       this.currentPollAbort = new AbortController();
       let updates: TgUpdate[];
@@ -176,23 +183,17 @@ export class TelegramTransport
       } finally {
         this.currentPollAbort = undefined;
       }
-      if (updates.length === 0) continue;
-      const maxId = updates[updates.length - 1].update_id;
+      await this.handler?.({ kind: "transport-progress" });
+      if (updates.length === 0) {
+        if (this.emptyPollBackoffMs > 0) await new Promise((r) => setTimeout(r, this.emptyPollBackoffMs));
+        continue;
+      }
+      for (const update of updates) this.persistInbox(update);
+      const maxId = Math.max(...updates.map((u) => u.update_id));
       this.writeOffset(maxId + 1);
       offset = maxId + 1;
       for (const u of updates) {
-        // One poison update must not tear down the whole poll loop (which would
-        // hit the top-level process.exit and rely on launchd to respawn). The
-        // offset was already advanced above, so a throwing update is skipped on
-        // the next iteration rather than reprocessed.
-        try {
-          const ev = normalizeUpdate(u);
-          if (ev && this.handler) await this.handler(ev);
-        } catch (e) {
-          process.stderr.write(
-            `[${new Date().toISOString()}] inbound dispatch error (update ${u.update_id}, skipped): ${e instanceof Error ? (e.stack ?? e.message) : String(e)}\n`,
-          );
-        }
+        await this.dispatchInboxUpdate(u);
       }
     }
   }
@@ -207,6 +208,64 @@ export class TelegramTransport
 
   async stop(): Promise<void> {
     this.running = false;
+    this.currentPollAbort?.abort();
+  }
+
+  private inboxPath(updateId: number): string {
+    return join(this.inboxDir, `${updateId}.json`);
+  }
+
+  private persistInbox(update: TgUpdate): void {
+    mkdirSync(this.inboxDir, { recursive: true, mode: 0o700 });
+    const path = this.inboxPath(update.update_id);
+    const tmp = `${path}.tmp.${process.pid}`;
+    const fd = openSync(tmp, "w", 0o600);
+    try {
+      writeFileSync(fd, `${JSON.stringify(update)}\n`);
+      fsyncSync(fd);
+    } finally { closeSync(fd); }
+    renameSync(tmp, path);
+  }
+
+  private readInbox(): TgUpdate[] {
+    let names: string[];
+    try { names = readdirSync(this.inboxDir); } catch { return []; }
+    const updates: TgUpdate[] = [];
+    for (const name of names.filter((n) => /^\d+\.json$/.test(n)).sort((a, b) => Number(a.slice(0, -5)) - Number(b.slice(0, -5)))) {
+      const path = join(this.inboxDir, name);
+      try {
+        const update = JSON.parse(readFileSync(path, "utf8")) as TgUpdate;
+        if (!Number.isSafeInteger(update.update_id) || update.update_id < 0) throw new Error("invalid update_id");
+        updates.push(update);
+      } catch (e) {
+        process.stderr.write(`telegram: corrupt inbox record ${name}: ${e instanceof Error ? e.message : String(e)} (discarded)\n`);
+        try { unlinkSync(path); } catch { /* raced cleanup */ }
+      }
+    }
+    return updates;
+  }
+
+  private async replayInbox(offset: number): Promise<number> {
+    const updates = this.readInbox();
+    if (updates.length === 0) return offset;
+    const recoveredOffset = Math.max(offset, Math.max(...updates.map((u) => u.update_id)) + 1);
+    if (recoveredOffset !== offset) this.writeOffset(recoveredOffset);
+    for (const update of updates) await this.dispatchInboxUpdate(update);
+    return recoveredOffset;
+  }
+
+  private async dispatchInboxUpdate(update: TgUpdate): Promise<void> {
+    try {
+      const ev = normalizeUpdate(update);
+      if (ev && this.handler) await this.handler(ev);
+    } catch (e) {
+      // Poison updates are explicitly discarded after logging; transient process
+      // death leaves the record on disk and it is replayed on the next start.
+      process.stderr.write(
+        `[${new Date().toISOString()}] inbound dispatch error (update ${update.update_id}, discarded): ${e instanceof Error ? (e.stack ?? e.message) : String(e)}\n`,
+      );
+    }
+    try { unlinkSync(this.inboxPath(update.update_id)); } catch { /* already absent */ }
   }
 
   async whoami(): Promise<{ id: string; username?: string; displayName?: string }> {

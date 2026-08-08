@@ -138,6 +138,9 @@ export type InboundEvent<Raw = unknown> =
   | { kind: "topic-renamed"; routingKey: RoutingKey; name: string; raw: Raw }
   | { kind: "joined"; address: ChatAddress; invitedBy?: SenderId; chatTitle?: string; needsAdminForText?: boolean; raw: Raw }
   | { kind: "removed"; address: ChatAddress; raw: Raw }
+  // Successful inbound read (including an empty long-poll). The poller uses
+  // this to heartbeat actual transport progress instead of a blind timer.
+  | { kind: "transport-progress" }
   // reconnecting; informational. Fatal errors → adapter throws from start()/run
   // loop → process.exit → launchd respawn.
   | { kind: "transport-degraded"; reason: string };
@@ -157,9 +160,9 @@ export interface ChatTransport {
   stop(): Promise<void>; // graceful, <5s (SIGTERM budget)
 
   /** Subscribe to normalized inbound events. Adapter owns reconnect; emits
-   *  `transport-degraded` while retrying. The adapter MUST persist its read
-   *  cursor BEFORE invoking the handler (Telegram offset-before-dispatch
-   *  durability contract) so a crash drops rather than double-delivers. */
+   *  `transport-degraded` while retrying and `transport-progress` after a
+   *  successful read. Before advancing its remote cursor, the adapter MUST
+   *  durably persist inbound work so a crash cannot silently drop it. */
   onEvent(handler: (e: InboundEvent) => Promise<void>): void;
 
   whoami(): Promise<{ id: string; username?: string; displayName?: string }>;

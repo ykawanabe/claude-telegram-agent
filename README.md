@@ -99,7 +99,7 @@ Send these inside Telegram (in the paired chat, as the paired user):
 | `cta pair-code --reset` | Regenerate (invalidates the previous code) |
 | `cta list` | Same as `/list` but in your terminal |
 | `cta mount <thread> <path>` | Same as `/mount` but in your terminal |
-| `cta config idle-evict <min>` | Evict idle Claude sessions after N minutes to free RAM (`0` = off; default off). Quiet topics are closed and resume on your next message; same knob as the Pager "Memory" toggle. Applies within ~25s, no restart |
+| `cta config idle-evict <min>` | Evict idle Claude sessions after N minutes to free RAM (`0` = off; default 15 min). Quiet topics are closed and resume on your next message; same knob as the Pager "Memory" toggle. At most two idle daemons remain warm by default (`MAX_WARM_DAEMONS=0` disables that cap). Applies within ~25s, no restart |
 | `cta config interrupt-steer <on\|off>` | Mid-turn steering (`on` by default). When on, a message sent while Claude is working interrupts and redirects it after a ~1.5s debounce. Set `off` to make new messages queue until the current task finishes. Same knob as the Pager "Mid-turn steering" toggle. Applies within ~25s, no restart |
 | `cta config sleep-fix <on\|off\|status>` | Harden macOS power settings so the poller never freezes when the Mac idles. `on` runs `sudo pmset -a sleep 0 disksleep 0 standby 0 powernap 0`; `status` reports it. See [troubleshooting](docs/troubleshooting.md) |
 | `cta task list` | List proactive scheduled tasks + each one's last-fire status |
@@ -134,11 +134,11 @@ The poller reads the bot token from `~/.claude/channels/telegram/.env` directly.
 The poller spawns each topic's `claude` with `--dangerously-skip-permissions`. That flag means:
 
 - **Every tool call is auto-approved.** Claude can read, write, and execute on your system without prompting.
-- **Anyone who can DM the bot has the same privileges Claude has.** If your bot token leaks or your allowlist is empty, that's a remote shell.
+- **The paired Telegram user has the same privileges Claude has.** If your bot token or pairing code leaks, treat that as remote-shell exposure and inspect `~/.pager/paired.json`.
 
 Mandatory hardening:
 
-1. Set the allowlist. Put your numeric Telegram user ID in `allowFrom` and set `dmPolicy: "allowlist"`. The installer asks for this, so don't skip it.
+1. Pair explicitly. Run `cta pair-code`, then send `/pair <code>` from the intended Telegram account and chat. Verify both `chat_id` and `user_id` in `~/.pager/paired.json`.
 2. Don't share the bot token. It lives at `~/.claude/channels/telegram/.env` with `chmod 600`. Don't commit it, don't paste it into chats.
 3. Treat this Mac as the trusted machine. Don't run the agent on a shared or unattended computer.
 4. Audit now and then. `tail -f ~/.pager/agent.log` shows what Claude is doing in real time.
@@ -152,7 +152,7 @@ See [docs/troubleshooting.md](docs/troubleshooting.md).
 Common issues:
 
 - `claude: command not found` from the LaunchAgent: a PATH issue in the plist, see the troubleshooting doc.
-- Messages not arriving: check the allowlist matches your Telegram user ID.
+- Messages not arriving: check `~/.pager/paired.json` matches both the current chat and your Telegram user ID.
 - The bot doesn't reconnect after a network outage: run `cta status`. The watchdog kickstarts a stale poller on its own, or `cta start` forces it.
 - The bot goes silent when the Mac sits idle: macOS idle-sleep (and Apple-Silicon standby/powernap) freeze the poller. Run `cta config sleep-fix on` (needs sudo); for true 24/7, run on a never-sleep Mac or a Linux host. See the [troubleshooting doc](docs/troubleshooting.md).
 

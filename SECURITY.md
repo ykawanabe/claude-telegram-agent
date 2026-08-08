@@ -6,14 +6,15 @@ This project lets you talk to [Claude Code](https://code.claude.com) on your Mac
 
 Practically:
 
-- Anyone who can send a Telegram DM to your bot can read, write, and execute on your Mac with the same scope Claude has.
+- The user and chat recorded in `~/.pager/paired.json` can read, write, and execute on your Mac with the same scope Claude has.
 - That includes browsing your files, modifying source code, running shell commands, calling MCP servers, hitting APIs you're logged into, and so on.
 
-If your bot token leaks, **assume your Mac has been compromised** until you rotate the token. If your allowlist is empty (`dmPolicy: open`), the bot is a public-internet shell.
+If your bot token or pairing code leaks, **assume your Mac has been compromised** until you rotate the token/code and inspect `~/.pager/paired.json`.
 
 ## Defenses this project provides
 
-- **Allowlist policy.** `install.sh` prompts for your Telegram numeric user ID and writes `dmPolicy: allowlist` to `~/.claude/channels/telegram/access.json`. The poller enforces this on every inbound message — DMs from users not in `allowFrom` are silently dropped.
+- **Paired identity policy.** Pairing writes both the Telegram chat ID and numeric user ID to `~/.pager/paired.json`. The poller requires both values to match on every inbound message and button press. Legacy `MAIN_CHAT_ID`-only configuration is ignored.
+- **Compatibility allowlist.** `install.sh` may also write `~/.claude/channels/telegram/access.json` for Telegram-channel compatibility. It is not the poller's authorization boundary; `paired.json` is.
 - **Token storage.** The bot token lives at `~/.claude/channels/telegram/.env` with mode `600` (owner read/write only), in a directory with mode `700`. The installer never echoes the token to stdout.
 - **Local-only.** No data leaves your Mac except Telegram messages routed through Telegram's API. There is no telemetry, no third-party logging, no remote update mechanism.
 - **No automatic privilege escalation.** The agent runs as your user. It does not request `sudo`.
@@ -35,7 +36,7 @@ If the issue is in Claude Code itself rather than this repo, please report it to
 
 Run through this before relying on the bot:
 
-- [ ] `~/.claude/channels/telegram/access.json` has your user ID in `allowFrom` and `dmPolicy` is `allowlist`.
+- [ ] `~/.pager/paired.json` contains the expected `chat_id` and your numeric Telegram `user_id`.
 - [ ] `~/.claude/channels/telegram/.env` is mode `600` (`ls -l ~/.claude/channels/telegram/.env` shows `-rw-------`).
 - [ ] Your bot's username (from `@BotFather` → `/mybots`) is not posted publicly.
 - [ ] Two-factor authentication is enabled on your Telegram account.

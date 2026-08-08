@@ -179,7 +179,19 @@ Bun.serve({
       }
       case "getUpdates": {
         const offset = Number((body as { offset?: number })?.offset ?? 0) || undefined;
-        const result = drainUpdates(offset);
+        let result = drainUpdates(offset);
+        if (result.length === 0) {
+          // Behave like a bounded Telegram long poll instead of returning an
+          // empty result immediately. Immediate empties make the poller and
+          // mock spin at thousands of requests/sec, obscuring real CPU/perf
+          // regressions and producing huge capture files. Cap at 250ms so the
+          // E2E suite stays fast, then drain again to pick up an update that
+          // arrived while this request was waiting.
+          const timeoutSec = Number((body as { timeout?: number })?.timeout ?? 0);
+          const waitMs = Math.min(Math.max(timeoutSec * 1000, 25), 250);
+          await Bun.sleep(waitMs);
+          result = drainUpdates(offset);
+        }
         return Response.json({ ok: true, result });
       }
       default:

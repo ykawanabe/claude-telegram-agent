@@ -36,8 +36,8 @@ rerun `./install.sh` so the paths are re-resolved.
 1. Confirm the bot token is present: `~/.claude/channels/telegram/.env` should
    hold `TELEGRAM_BOT_TOKEN=...`. A rejected token fails the poller's startup
    preflight — `~/.pager/agent.log` says so on the first lines after a restart.
-2. Confirm the allowlist matches your Telegram user ID. Messages from anyone
-   not on the allowlist are silently dropped.
+2. Confirm `~/.pager/paired.json` matches both this chat and your Telegram user
+   ID. Any mismatch is silently dropped.
 3. Confirm the chat is paired: `cta status` shows the paired chat, or send
    `/pair <code>` (run `cta pair-code` to see the code).
 4. Watch it live: `tail -f ~/.pager/agent.log` shows each inbound update being
