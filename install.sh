@@ -217,15 +217,19 @@ if [[ -d "$REPO_DIR/agent" ]]; then
   # by the transport factory, Telegram transport and poller at module load.
   cp "$REPO_DIR/agent/delivery/inbound/index.ts" \
      "$REPO_DIR/agent/delivery/inbound/journal.ts" \
+     "$REPO_DIR/agent/delivery/inbound/journal.kill-fixture.ts" \
      "$REPO_DIR/agent/delivery/inbound/types.ts" \
+     "$REPO_DIR/agent/delivery/inbound/INTEGRATION.md" \
      "$AGENT_DIR/delivery/inbound/"
   cp "$REPO_DIR/agent/delivery/outbound/index.ts" \
      "$REPO_DIR/agent/delivery/outbound/outbox.ts" \
      "$REPO_DIR/agent/delivery/outbound/store.ts" \
      "$REPO_DIR/agent/delivery/outbound/telegram-sender.ts" \
      "$REPO_DIR/agent/delivery/outbound/types.ts" \
+     "$REPO_DIR/agent/delivery/outbound/INTEGRATION.md" \
      "$AGENT_DIR/delivery/outbound/"
   cp "$REPO_DIR/agent/observability/README.md" \
+     "$REPO_DIR/agent/observability/INTEGRATION.md" \
      "$REPO_DIR/agent/observability/events.ts" \
      "$REPO_DIR/agent/observability/fault-injection.ts" \
      "$REPO_DIR/agent/observability/index.ts" \
