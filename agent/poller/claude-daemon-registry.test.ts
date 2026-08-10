@@ -207,7 +207,7 @@ describe("ClaudeDaemonRegistry resetTopic (/clear semantics)", () => {
       debounceMs: 50,
       daemonOptsFor: () => {
         optsCalls++;
-        return { cwd: "/tmp" };
+        return { cwd: "/tmp", env: { FAKE_CLAUDE_MODE: "slow" } };
       },
       onText: () => {},
       onFlush: (_t, combinedText) => sentToDaemon.push(combinedText),
