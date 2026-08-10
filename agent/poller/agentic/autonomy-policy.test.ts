@@ -1,4 +1,7 @@
 import { test, expect, describe } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { classify, isInsideMount, type ToolCall } from "./autonomy-policy";
 
 const MOUNT = "/work/proj";
@@ -32,8 +35,17 @@ describe("edit tools — in-mount silent, outside ask", () => {
 });
 
 describe("bash — safe verbs silent", () => {
-  for (const c of ["ls -la", "cat README.md", "rg TODO src", "bun test", "npm test", "tsc --noEmit", "jq . package.json", "echo hi", "pwd"]) {
+  for (const c of ["ls -la", "cat README.md", "rg TODO src", "jq . package.json", "echo hi", "pwd"]) {
     test(`'${c}' → silent`, () => expect(classify(bash(c)).tier).toBe("silent"));
+  }
+});
+
+describe("bash — interpreters and build tools always ask", () => {
+  for (const c of [
+    "python3 script.py", "node script.js", "bun test", "npm test", "pnpm lint",
+    "tsc --noEmit", "cargo test", "go test ./...", "bash script.sh", "make test",
+  ]) {
+    test(`'${c}' → ask`, () => expect(classify(bash(c)).tier).toBe("ask"));
   }
 });
 
@@ -194,4 +206,18 @@ describe("isInsideMount", () => {
   test("traversal escape", () => expect(isInsideMount("../../../etc", MOUNT)).toBe(false));
   test("home tilde outside", () => expect(isInsideMount("~/secret", MOUNT)).toBe(false));
   test("sibling prefix not inside", () => expect(isInsideMount("/work/proj-evil/x", MOUNT)).toBe(false));
+  test("symlinked parent escaping a real mount is outside", () => {
+    const base = mkdtempSync(join(tmpdir(), "agentic-policy-"));
+    const root = join(base, "root");
+    const outside = join(base, "outside");
+    mkdirSync(root);
+    mkdirSync(outside);
+    symlinkSync(outside, join(root, "escape"));
+    try {
+      expect(isInsideMount("escape/payload.ts", root)).toBe(false);
+      expect(classify(call("Write", { file_path: "escape/payload.ts" }, root)).tier).toBe("ask");
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
 });

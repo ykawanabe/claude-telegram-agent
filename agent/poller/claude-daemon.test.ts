@@ -25,6 +25,12 @@ describe("ClaudeDaemon basic lifecycle", () => {
     expect(daemon.isAlive).toBe(true);
   });
 
+  test("start rejects when the executable cannot be spawned", async () => {
+    daemon = new ClaudeDaemon({ claudeBin: "/definitely/missing/claude", cwd: "/tmp" });
+    await expect(daemon.start()).rejects.toThrow();
+    expect(daemon.isAlive).toBe(false);
+  });
+
   test("stop terminates the subprocess; isAlive flips false", async () => {
     daemon = new ClaudeDaemon({ claudeBin: FIXTURE, cwd: "/tmp" });
     await daemon.start();
@@ -88,6 +94,19 @@ describe("ClaudeDaemon streaming output (multi-block turn)", () => {
     await waitFor(() => texts.length >= 2, 5000);
     expect(texts[0]).toBe("thinking…");
     expect(texts[1]).toBe("answer: hi");
+  });
+
+  test("does not expose an unterminated stdout tail until a newline arrives", () => {
+    const daemon = new ClaudeDaemon({ claudeBin: FIXTURE, cwd: "/tmp" });
+    const texts: string[] = [];
+    daemon.on("text", (s: string) => texts.push(s));
+    const feedStdout = daemon as unknown as { onStdout(chunk: string): void };
+
+    feedStdout.onStdout('{"type":"assistant","message":{"content":[{"type":"text","text":"tail"}]}}');
+    expect(texts).toEqual([]);
+
+    feedStdout.onStdout("\n");
+    expect(texts).toEqual(["tail"]);
   });
 });
 

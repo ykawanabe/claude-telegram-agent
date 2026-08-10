@@ -58,8 +58,8 @@ h_setup_sandbox() {
   # resolve their helpers under the standard $CTA_INSTALL_DIR layout.
   #
   # Copy whole source dirs, NOT a hand-picked file list. poller.ts's import
-  # graph stays entirely within these four dirs (verified: only ./,
-  # ../channels, ../mount-store, ../lib imports). A cherry-picked cp list
+  # graph stays entirely within these dirs (verified: only ./, ../channels,
+  # ../delivery, ../observability, ../mount-store, ../tasks-store, ../lib imports). A cherry-picked cp list
   # silently broke ALL e2e twice — when P4 added buttons-marker.ts, then
   # again when the FDA work added file-access-probe.ts — because CI never
   # runs e2e to catch the drift. Directory copies are self-maintaining: a
@@ -67,8 +67,11 @@ h_setup_sandbox() {
   # and total <400K, so the copy stays cheap.
   cp -R "$REPO_DIR/agent/poller" "$CTA_INSTALL_DIR/agent/"
   cp -R "$REPO_DIR/agent/mount-store" "$CTA_INSTALL_DIR/agent/"
+  cp -R "$REPO_DIR/agent/tasks-store" "$CTA_INSTALL_DIR/agent/"
   cp -R "$REPO_DIR/agent/lib" "$CTA_INSTALL_DIR/agent/"
   cp -R "$REPO_DIR/agent/channels" "$CTA_INSTALL_DIR/agent/"
+  cp -R "$REPO_DIR/agent/delivery" "$CTA_INSTALL_DIR/agent/"
+  cp -R "$REPO_DIR/agent/observability" "$CTA_INSTALL_DIR/agent/"
 
   # Plugin .env (the canonical TELEGRAM_BOT_TOKEN source).
   mkdir -p "$SCENARIO_DIR/plugin"
@@ -77,7 +80,6 @@ TELEGRAM_BOT_TOKEN=FAKE-E2E-TOKEN
 EOF
   # Project .env. POLL_TIMEOUT_SEC tuned low so scenarios complete fast.
   cat > "$CTA_STATE_DIR/.env" <<'EOF'
-MAIN_CHAT_ID=-1001234
 MULTI_TOPIC=1
 POLL_TIMEOUT_SEC=1
 EOF
@@ -149,8 +151,6 @@ h_spawn_poller() {
   # The poller respects TELEGRAM_API_BASE: we keep the api-base exactly
   # matching the getApiBase() return shape (no /bot<TOKEN> suffix — the
   # adapter appends that).
-  export MAIN_CHAT_ID="-1001234"
-
   tmux -S "$TMUX_SOCKET" new-session -d -s poller \
     "bash -c '
       set -a

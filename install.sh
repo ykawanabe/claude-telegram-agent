@@ -163,10 +163,13 @@ rm -f "$BIN_DIR/restart_claude.sh" 2>/dev/null || true
 # ~/.local/share).
 AGENT_DIR="$INSTALL_DIR/agent"
 if [[ -d "$REPO_DIR/agent" ]]; then
-  mkdir -p "$AGENT_DIR/lib" "$AGENT_DIR/poller" "$AGENT_DIR/poller/heartbeat-checks" "$AGENT_DIR/poller/agentic" "$AGENT_DIR/mount-store" "$AGENT_DIR/tasks-store" "$AGENT_DIR/channels/telegram"
+  mkdir -p "$AGENT_DIR/lib" "$AGENT_DIR/poller" "$AGENT_DIR/poller/heartbeat-checks" "$AGENT_DIR/poller/agentic" "$AGENT_DIR/mount-store" "$AGENT_DIR/tasks-store" "$AGENT_DIR/channels/telegram" "$AGENT_DIR/delivery/inbound" "$AGENT_DIR/delivery/outbound" "$AGENT_DIR/observability"
   cp "$REPO_DIR/agent/lib/paths.ts" "$AGENT_DIR/lib/"
   cp "$REPO_DIR/agent/poller/poller.ts" \
      "$REPO_DIR/agent/poller/package.json" \
+     "$REPO_DIR/agent/poller/contracts.ts" \
+     "$REPO_DIR/agent/poller/bot-feature.ts" \
+     "$REPO_DIR/agent/poller/transcript-cursor.ts" \
      "$REPO_DIR/agent/poller/claude-daemon.ts" \
      "$REPO_DIR/agent/poller/claude-daemon-registry.ts" \
      "$REPO_DIR/agent/poller/buttons-marker.ts" \
@@ -210,6 +213,26 @@ if [[ -d "$REPO_DIR/agent" ]]; then
      "$REPO_DIR/agent/channels/telegram/transport.ts" \
      "$REPO_DIR/agent/channels/telegram/typing-keepalive.ts" \
      "$AGENT_DIR/channels/telegram/"
+  # Wave 1 durable delivery and reliability instrumentation. These are imported
+  # by the transport factory, Telegram transport and poller at module load.
+  cp "$REPO_DIR/agent/delivery/inbound/index.ts" \
+     "$REPO_DIR/agent/delivery/inbound/journal.ts" \
+     "$REPO_DIR/agent/delivery/inbound/types.ts" \
+     "$AGENT_DIR/delivery/inbound/"
+  cp "$REPO_DIR/agent/delivery/outbound/index.ts" \
+     "$REPO_DIR/agent/delivery/outbound/outbox.ts" \
+     "$REPO_DIR/agent/delivery/outbound/store.ts" \
+     "$REPO_DIR/agent/delivery/outbound/telegram-sender.ts" \
+     "$REPO_DIR/agent/delivery/outbound/types.ts" \
+     "$AGENT_DIR/delivery/outbound/"
+  cp "$REPO_DIR/agent/observability/README.md" \
+     "$REPO_DIR/agent/observability/events.ts" \
+     "$REPO_DIR/agent/observability/fault-injection.ts" \
+     "$REPO_DIR/agent/observability/index.ts" \
+     "$REPO_DIR/agent/observability/metrics.ts" \
+     "$REPO_DIR/agent/observability/monitor.ts" \
+     "$REPO_DIR/agent/observability/reliability-gate.ts" \
+     "$AGENT_DIR/observability/"
   cp "$REPO_DIR/agent/mount-store/mount-store.ts" "$REPO_DIR/agent/mount-store/package.json" "$AGENT_DIR/mount-store/"
   # Scheduled-tasks store. poller.ts imports ../tasks-store/tasks-store; without
   # this copy the installed poller crashes on startup ("Cannot find module").

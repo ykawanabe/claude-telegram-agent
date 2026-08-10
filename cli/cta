@@ -509,7 +509,7 @@ PY
 # setting. Mirrors _config_ack's JSON-merge so any other settings keys survive.
 _config_idle_evict() {
   local val="${1:-}"
-  # No value → print the current threshold (0 when unset/missing/corrupt).
+  # No value → print the current threshold (15 when unset/missing/corrupt).
   if [[ -z "$val" ]]; then
     if [[ -f "$SETTINGS_FILE" ]]; then
       python3 - "$SETTINGS_FILE" <<'PY'
@@ -517,12 +517,12 @@ import json, sys
 try:
     with open(sys.argv[1]) as f:
         data = json.load(f)
-    print(int(data.get("idle_evict_minutes", 0) or 0))
+    print(int(data.get("idle_evict_minutes", 15)))
 except Exception:
-    print(0)
+    print(15)
 PY
     else
-      echo 0
+      echo 15
     fi
     return 0
   fi

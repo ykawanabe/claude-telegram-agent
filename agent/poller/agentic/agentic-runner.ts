@@ -21,6 +21,7 @@
  */
 
 import { join } from "node:path";
+import { createTranscriptCursor, type TranscriptEvent } from "../transcript-cursor";
 
 export interface AgenticRunOpts {
   /** Project directory — claude's cwd AND the sandbox root the gate uses for in-mount checks. */
@@ -180,42 +181,31 @@ export function makeStreamHandler(onText?: (t: string) => void): {
   push: (chunk: string) => void;
   flush: () => StreamAccum;
 } {
-  let buf = "";
+  const cursor = createTranscriptCursor();
   let finalText = "";
   let totalCostUsd = 0;
   let resultError: string | null = null;
-  const handleLine = (line: string) => {
-    const t = line.trim();
-    if (!t) return;
-    let e: any;
-    try { e = JSON.parse(t); } catch { return; }
-    if (!e || typeof e !== "object") return;
-    if (e.type === "assistant") {
-      for (const b of (e.message?.content ?? [])) {
-        if (b?.type === "text" && typeof b.text === "string" && b.text.length) {
-          finalText = b.text;
-          onText?.(b.text);
-        }
+  const applyEvents = (events: TranscriptEvent[]) => {
+    for (const event of events) {
+      if (event.type === "assistant") {
+        finalText = event.text;
+        onText?.(event.text);
+        continue;
       }
-    } else if (e.type === "result") {
-      if (typeof e.total_cost_usd === "number") totalCostUsd = e.total_cost_usd;
+
+      if (event.costUsd !== undefined) totalCostUsd = event.costUsd;
       // claude reports model-unavailable / rate-limit failures in the result
       // event (is_error:true, result:<reason>), NOT on stderr. Capture it so the
       // exit-code error message carries the real reason instead of being blank.
-      if (e.is_error === true && typeof e.result === "string" && e.result) resultError = e.result;
+      if (event.isError === true && event.result) resultError = event.result;
     }
   };
   return {
     push(chunk: string) {
-      buf += chunk;
-      let nl: number;
-      while ((nl = buf.indexOf("\n")) >= 0) {
-        handleLine(buf.slice(0, nl));
-        buf = buf.slice(nl + 1);
-      }
+      applyEvents(cursor.push(chunk));
     },
     flush() {
-      if (buf.trim()) { handleLine(buf); buf = ""; }
+      applyEvents(cursor.finish());
       return { finalText, totalCostUsd, resultError };
     },
   };

@@ -197,17 +197,17 @@ final class CTAClientTests: XCTestCase {
         XCTAssertEqual(CTAClient.idleEvictMinutes(), 30)
     }
 
-    func test_idleEvictMinutes_missingFileOrKey_returnsZero() throws {
+    func test_idleEvictMinutes_missingFileOrKey_returnsRecommendedDefault() throws {
         let tmp = NSTemporaryDirectory() + "cta-pager-settings-zero-\(UUID().uuidString)"
         try FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(atPath: tmp) }
         setenv("CTA_STATE_DIR", tmp, 1)
         defer { unsetenv("CTA_STATE_DIR") }
-        // No settings.json yet → eviction disabled.
-        XCTAssertEqual(CTAClient.idleEvictMinutes(), 0)
-        // File present but key absent (only other settings) → disabled.
+        // No settings.json yet → recommended 15-minute default.
+        XCTAssertEqual(CTAClient.idleEvictMinutes(), 15)
+        // File present but key absent (only other settings) → same default.
         try #"{"version":1}"#.write(toFile: "\(tmp)/settings.json", atomically: true, encoding: .utf8)
-        XCTAssertEqual(CTAClient.idleEvictMinutes(), 0)
+        XCTAssertEqual(CTAClient.idleEvictMinutes(), 15)
     }
 
     // MARK: - settings.json (interrupt-steer / mid-turn auto-steer)

@@ -25,6 +25,9 @@ watch_network.sh	bin	755
 # Poller (TypeScript / bun)
 poller/poller.ts	agent	644
 poller/package.json	agent	644
+poller/contracts.ts	agent	644
+poller/bot-feature.ts	agent	644
+poller/transcript-cursor.ts	agent	644
 poller/claude-daemon.ts	agent	644
 poller/claude-daemon-registry.ts	agent	644
 poller/buttons-marker.ts	agent	644
@@ -58,6 +61,25 @@ channels/transport-factory.ts	agent	644
 channels/telegram/adapter.ts	agent	644
 channels/telegram/transport.ts	agent	644
 channels/telegram/typing-keepalive.ts	agent	644
+
+# Wave 1 durable delivery. Unit/fault tests remain in the repository.
+delivery/inbound/index.ts	agent	644
+delivery/inbound/journal.ts	agent	644
+delivery/inbound/types.ts	agent	644
+delivery/outbound/index.ts	agent	644
+delivery/outbound/outbox.ts	agent	644
+delivery/outbound/store.ts	agent	644
+delivery/outbound/telegram-sender.ts	agent	644
+delivery/outbound/types.ts	agent	644
+
+# Reliability events, metrics, rollout gate and fault-injection surface.
+observability/README.md	agent	644
+observability/events.ts	agent	644
+observability/fault-injection.ts	agent	644
+observability/index.ts	agent	644
+observability/metrics.ts	agent	644
+observability/monitor.ts	agent	644
+observability/reliability-gate.ts	agent	644
 
 # Mount-store library + CLI entrypoint
 mount-store/mount-store.ts	agent	644

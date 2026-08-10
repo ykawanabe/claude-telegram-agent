@@ -70,6 +70,19 @@ describe("makeStreamHandler", () => {
     h.push('{"type":"result","total_cost_usd":1}\n');
     expect(h.flush().totalCostUsd).toBe(1);
   });
+  test("flushes the EOF tail and keeps the last text, cost, and result error", () => {
+    const seen: string[] = [];
+    const h = makeStreamHandler((t) => seen.push(t));
+    h.push('{"type":"assistant","message":{"content":[{"type":"text","text":"first"},{"type":"text","text":"last"}]}}\n');
+    h.push('{"type":"result","is_error":true,"result":"rate limited","total_cost_usd":0.75}');
+
+    expect(h.flush()).toEqual({
+      finalText: "last",
+      totalCostUsd: 0.75,
+      resultError: "rate limited",
+    });
+    expect(seen).toEqual(["first", "last"]);
+  });
 });
 
 // Fake spawn that streams canned stream-json then exits with the given code.

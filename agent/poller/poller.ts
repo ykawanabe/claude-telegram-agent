@@ -44,6 +44,8 @@ import {
 } from "./slash-commands";
 import { ClaudeDaemonRegistry } from "./claude-daemon-registry";
 import type { ClaudeDaemonOptions } from "./claude-daemon";
+import { parseBotCommand, type BotFeature } from "./bot-feature";
+import type { DaemonEvent, EventSink, ResourceGovernor } from "./contracts";
 import { parseButtonsMarker } from "./buttons-marker";
 import {
   type HeartbeatState,
@@ -68,7 +70,6 @@ import { renderApprovalCard, approvalButtonRows, parseApprovalCallback, applyEdi
 // unchanged). The poller keeps the *policy* — ack on/off + glyph, typing
 // keepalive, offset — and drives this dumb wire. See ../channels/telegram/adapter.ts.
 import {
-  sendInlineKeyboard,
   answerCallback,
   getUpdates,
   getMe,
@@ -83,8 +84,17 @@ import type {
   TgUpdate,
   TgChatMemberUpdated,
 } from "../channels/telegram/adapter";
-import { makeTransport } from "../channels/transport-factory";
-import { isButtonCapable, isEditable, isInterruptible, isReactable, isTyping, type AckHandle, type ChatAddress, type ChatTransport, type Channel, type InboundEvent } from "../channels/types";
+import { makeOutboundQueue, makeTransport } from "../channels/transport-factory";
+import { isButtonCapable, isEditable, isInterruptible, isReactable, isTyping, type ChatAddress, type ChatTransport, type Channel, type InboundEvent, type InboundHandlerResult } from "../channels/types";
+import type { OutboxEvent } from "../delivery/outbound";
+import {
+  JsonlEventSink,
+  ReliabilityGate,
+  ReliabilityMonitor,
+  StructuredEventReporter,
+  createObservedDaemonEventSink,
+  createSafeReliabilityHooks,
+} from "../observability";
 
 /** The normalized message-kind event the command pipeline consumes (replaces the
  *  raw TgMessage every handler used to take). Carries everything a handler needs
@@ -124,7 +134,51 @@ function chatIdOf(ev: InboundMessageEvent): number {
 // Phase 0: only Telegram is registered in the factory; CTA_CHANNEL unset →
 // "telegram", so production is unchanged.
 const activeChannel: Channel = (process.env.CTA_CHANNEL as Channel) ?? "telegram";
+let reportedObservabilitySinkFailure = false;
+const reliabilityReporter = new StructuredEventReporter({
+  source: "poller",
+  sink: new JsonlEventSink(join(stateDir(), "observability", "events.jsonl")),
+  onSinkError(error) {
+    if (reportedObservabilitySinkFailure) return;
+    reportedObservabilitySinkFailure = true;
+    process.stderr.write(`poller: observability sink failed: ${error instanceof Error ? error.message : String(error)}\n`);
+  },
+});
+const reliabilityMonitor = new ReliabilityMonitor({ reporter: reliabilityReporter });
+const reliabilityHooks = createSafeReliabilityHooks(reliabilityMonitor);
+const reliabilityGate = new ReliabilityGate({
+  reporter: reliabilityReporter,
+  thresholds: {
+    maxQueueDepth: Number(process.env.CTA_MAX_QUEUE_DEPTH ?? "1000"),
+    maxTurnP95Ms: Number(process.env.CTA_MAX_TURN_P95_MS ?? `${10 * 60_000}`),
+    maxTelegramFailureRate: Number(process.env.CTA_MAX_TELEGRAM_FAILURE_RATE ?? "0.25"),
+    minTelegramSamples: Number(process.env.CTA_MIN_TELEGRAM_SAMPLES ?? "20"),
+    maxRssBytes: Number(process.env.CTA_MAX_RSS_BYTES ?? `${2 * 1024 * 1024 * 1024}`),
+  },
+});
+const outboundAttemptStartedAt = new Map<string, number>();
+function observeOutboxEvent(event: OutboxEvent): void {
+  if (event.name === "outbox.attempt_started") {
+    outboundAttemptStartedAt.set(event.outboxId, event.at);
+    return;
+  }
+  const terminalAttempt = event.name === "outbox.delivered"
+    || event.name === "outbox.retry_scheduled"
+    || event.name === "outbox.dead_lettered"
+    || event.name === "outbox.uncertain";
+  if (!terminalAttempt) return;
+  const startedAt = outboundAttemptStartedAt.get(event.outboxId);
+  outboundAttemptStartedAt.delete(event.outboxId);
+  reliabilityHooks.recordTelegramRequest({
+    operation: "sendMessage",
+    ok: event.name === "outbox.delivered",
+    status: event.httpStatus,
+    latencyMs: startedAt == null ? undefined : Math.max(0, event.at - startedAt),
+    retryAfterMs: event.retryAfterMs,
+  });
+}
 const transport: ChatTransport = makeTransport(activeChannel);
+const outboundQueue = makeOutboundQueue(transport, { events: observeOutboxEvent });
 
 /** Outbound plain text. Flows through transport.sendText (which chunks >4096 and
  *  returns a ref). Takes a platform-agnostic ChatAddress — the poller no longer
@@ -132,7 +186,7 @@ const transport: ChatTransport = makeTransport(activeChannel);
  *  the identical path. Handlers pass the inbound event's `ev.address`; the few
  *  non-inbound senders (daemon stream, mount prompt) build one via `tgAddr`. */
 async function reply(to: ChatAddress, text: string): Promise<void> {
-  await transport.sendText({ to, text });
+  await outboundQueue.enqueue({ kind: "text", to, text });
 }
 
 /** Build a Telegram ChatAddress from raw ids. Transitional helper for the
@@ -166,7 +220,6 @@ import { runFileAccessProbe } from "./file-access-probe";
 // a real bot token. Tests override CTA_STATE_DIR to redirect state files
 // and TELEGRAM_API_BASE to route outbound calls at a mock server.
 
-const ENV_MAIN_CHAT_ID = process.env.MAIN_CHAT_ID; // optional Phase 2 override
 const POLL_TIMEOUT_SEC = Number(process.env.POLL_TIMEOUT_SEC ?? "25");
 
 const STATE_DIR = stateDir();
@@ -229,11 +282,11 @@ function touchHeartbeat(): void {
 }
 
 // ─── paired state ────────────────────────────────────────────────────────────
-// Phase 3 zero-config onboarding: instead of MAIN_CHAT_ID in .env, the user
-// pairs the bot in-chat by sending `/pair <code>`. The poller writes the
-// resulting chat_id + user_id to paired.json. MAIN_CHAT_ID env (Phase 2
-// holdover) is honored as a fallback for users upgrading from the manual
-// flow — paired.json wins if both exist.
+// Phase 3 zero-config onboarding: the user pairs the bot in-chat by sending
+// `/pair <code>`. The poller writes BOTH chat_id + user_id to paired.json.
+// A legacy MAIN_CHAT_ID is deliberately ignored: chat-only authorization lets
+// every member of that group drive the host, so inbound dispatch fails closed
+// until a complete paired.json exists.
 
 interface PairedState {
   version: 1;
@@ -247,9 +300,12 @@ let pairedCache: PairedState | null = null;
 let pairedMtimeMs = 0;
 
 // Idle-daemon-eviction threshold (minutes; 0 = disabled), live-reloaded from
-// settings.json each poll loop. 0 unless the operator opts in via
-// `cta config idle-evict <min>` (the Pager "Memory" toggle).
-let idleEvictMinutes = 0;
+// settings.json each poll loop. Default 15 minutes: a warm claude process is
+// roughly 500 MB on a typical session, so leaving every visited topic resident
+// indefinitely is a poor default. Operators can still disable it explicitly
+// with `cta config idle-evict 0` (the Pager "Memory" toggle).
+const DEFAULT_IDLE_EVICT_MINUTES = 15;
+let idleEvictMinutes = DEFAULT_IDLE_EVICT_MINUTES;
 // Mid-turn auto-steer: when a message arrives during an in-flight turn, the
 // registry debounces then gracefully interrupts so the batched messages flow
 // into the next turn. Default ON; operator opt-out via
@@ -302,6 +358,14 @@ const IDLE_FLUSH_TIMEOUT_MS = ((): number => {
   const n = Number(process.env.IDLE_FLUSH_TIMEOUT_MS);
   return Number.isFinite(n) && n > 0 ? n : 3 * 60_000; // malformed/unset env → default
 })();
+// Bound the aggregate RAM held by quiet topic daemons. 0 disables this
+// capacity cap; unset/malformed defaults to two warm daemons. Capacity eviction
+// only targets idle+empty topics and preserves their session UUID for resume.
+const MAX_WARM_DAEMONS = ((): number => {
+  if (process.env.MAX_WARM_DAEMONS == null) return 2;
+  const n = Number(process.env.MAX_WARM_DAEMONS);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 2;
+})();
 // Topics with an in-flight idle flush, so the sweep doesn't launch a second.
 const idleFlushing = new Set<string>();
 // Epoch ms of the last file-access (FDA) probe; throttles re-probing to ~60s.
@@ -318,11 +382,23 @@ function refreshPairedIfChanged(): void {
       const raw = readFileSync(PAIRED_STATE_FILE, "utf8");
       const parsed = JSON.parse(raw) as PairedState;
       if (parsed.version !== 1) throw new Error("paired.json: unknown version");
+      if (!Number.isSafeInteger(parsed.chat_id)) throw new Error("paired.json: invalid chat_id");
+      if (!Number.isSafeInteger(parsed.user_id) || parsed.user_id <= 0) {
+        throw new Error("paired.json: invalid user_id");
+      }
+      if (typeof parsed.paired_at !== "string" || parsed.paired_at.length === 0) {
+        throw new Error("paired.json: invalid paired_at");
+      }
       pairedCache = parsed;
     }
     pairedMtimeMs = mtimeMs;
     process.stdout.write(`[${new Date().toISOString()}] paired state reloaded (${pairedCache ? `chat=${pairedCache.chat_id} user=${pairedCache.user_id}` : "unpaired"})\n`);
   } catch (e) {
+    // Authorization state is security-sensitive. A corrupt/truncated/legacy
+    // file must not retain an earlier permissive cache or degrade to chat-only
+    // routing. Mark this mtime handled and remain unpaired until it is fixed.
+    pairedCache = null;
+    pairedMtimeMs = mtimeMs;
     process.stderr.write(`poller: paired.json reload failed: ${e instanceof Error ? e.message : String(e)}\n`);
   }
 }
@@ -338,7 +414,7 @@ function refreshSettingsIfChanged(): void {
   try { mtimeMs = statSync(SETTINGS_FILE).mtimeMs; } catch { /* missing → disabled below */ }
   if (mtimeMs === settingsMtimeMs) return;
   try {
-    let next = 0;
+    let next = DEFAULT_IDLE_EVICT_MINUTES;
     if (mtimeMs !== 0) {
       const raw = readFileSync(SETTINGS_FILE, "utf8");
       const parsed = JSON.parse(raw) as {
@@ -352,8 +428,8 @@ function refreshSettingsIfChanged(): void {
         agenticEffort?: string;
       };
       if (parsed.version !== 1) throw new Error("settings.json: unknown version");
-      const n = Number(parsed.idle_evict_minutes ?? 0);
-      next = Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
+      const n = Number(parsed.idle_evict_minutes ?? DEFAULT_IDLE_EVICT_MINUTES);
+      next = Number.isFinite(n) && n >= 0 ? Math.floor(n) : DEFAULT_IDLE_EVICT_MINUTES;
       const steer = parsed.interrupt_on_message;
       if (typeof steer === "boolean" && steer !== interruptOnMessage) {
         interruptOnMessage = steer;
@@ -415,13 +491,17 @@ function writePairedAtomic(state: PairedState): void {
 }
 
 function effectiveChatId(): string | null {
-  if (pairedCache) return String(pairedCache.chat_id);
-  if (ENV_MAIN_CHAT_ID) return ENV_MAIN_CHAT_ID;
-  return null;
+  return pairedCache ? String(pairedCache.chat_id) : null;
 }
 
 function effectiveUserId(): number | null {
   return pairedCache?.user_id ?? null;
+}
+
+function isAuthorizedInbound(ev: InboundMessageEvent | ButtonPressEvent): boolean {
+  if (!pairedCache || ev.address.channel !== "telegram") return false;
+  return ev.address.chatId === pairedCache.chat_id
+    && ev.from.id === String(pairedCache.user_id);
 }
 
 // ─── outbound reply ──────────────────────────────────────────────────────────
@@ -441,25 +521,6 @@ function effectiveUserId(): number | null {
 //
 // (Typing is likewise transport-owned now — TypingIndicating.startTyping at
 // dispatch + clearTypingExternal at turn-end.)
-
-/** Per-topic queue of ack handles awaiting the "read" flip. Drained on onFlush. */
-const pendingReadAcks: Map<string, AckHandle[]> = new Map();
-
-function trackPendingRead(threadIdStr: string, handle: AckHandle): void {
-  let list = pendingReadAcks.get(threadIdStr);
-  if (!list) { list = []; pendingReadAcks.set(threadIdStr, list); }
-  list.push(handle);
-}
-
-/** Registry onFlush hook: the batch just got written to claude's stdin, so every
- *  queued message in this turn is now "read" by the LLM. One flush → many handles
- *  flipped to 👌 at once (N:1). */
-function onDaemonFlush(threadIdStr: string, _combinedText: string): void {
-  const list = pendingReadAcks.get(threadIdStr);
-  if (!list || list.length === 0) return;
-  pendingReadAcks.delete(threadIdStr);
-  if (isReactable(transport)) void transport.setReadAcks(list);
-}
 
 // ─── topic name cache ────────────────────────────────────────────────────────
 // Bot API has no getForumTopic / getForumTopicByID, so the only way to learn
@@ -803,7 +864,8 @@ function postTelegramTextFromDaemon(threadIdStr: string, text: string): void {
   // transport's ButtonCapable path. No marker → plain text as before.
   const { body, buttons } = parseButtonsMarker(text);
   if (buttons && buttons.length > 0 && isButtonCapable(transport)) {
-    void transport.sendButtons({
+    void outboundQueue.enqueue({
+      kind: "buttons",
       to: { channel: "telegram", chatId: chat_id, threadId },
       text: body || "Choose:",
       buttons,
@@ -873,6 +935,39 @@ function onDaemonTurnEnd(threadIdStr: string, info: { costUsd: number | null; se
   }
 }
 
+/** Translate registry-domain events to the poller's existing side effects.
+ * EventSink is synchronous by contract, preserving callback ordering. */
+const daemonEventSink: EventSink = {
+  emit(event: DaemonEvent): void {
+    switch (event.kind) {
+      case "text":
+        postTelegramTextFromDaemon(event.threadId, event.text);
+        return;
+      case "flush":
+        return;
+      case "turn-start":
+        onDaemonTurnStart(event.threadId);
+        return;
+      case "turn-end":
+        onDaemonTurnEnd(event.threadId, {
+          costUsd: event.costUsd,
+          sessionId: event.sessionId,
+        });
+        return;
+      case "spawn":
+      case "crash":
+        return;
+      case "spawn-failed":
+        onDaemonSpawnFail(event.threadId);
+        return;
+      case "crash-loop":
+        onDaemonCrashLoop(event.threadId, event.crashCount);
+        return;
+    }
+  },
+};
+const observedDaemonEventSink = createObservedDaemonEventSink(reliabilityMonitor, daemonEventSink);
+
 /** Initialize the daemon registry. Called once in main(). */
 function initDaemonRegistry(): void {
   if (daemonRegistry) return;
@@ -900,22 +995,17 @@ function initDaemonRegistry(): void {
     // wedge). Without this, the only recovery was the 5-min inFlight watchdog →
     // 5 min of silence. 12s SIGKILLs + respawns + flushes the steer instead.
     interruptEscalateMs: Number(process.env.PAGER_INTERRUPT_ESCALATE_MS ?? "12000"),
-    onText: postTelegramTextFromDaemon,
-    onFlush: onDaemonFlush,
-    onTurnStart: onDaemonTurnStart,
-    onTurnEnd: onDaemonTurnEnd,
-    onSpawnFail: onDaemonSpawnFail,
-    onCrashLoop: onDaemonCrashLoop,
+    eventSink: observedDaemonEventSink,
   });
 }
 
 /**
  * Phase 4 dispatch: hand the message to the registry. Registry handles
  * spawn-if-needed, debounce, per-topic queue, turn streaming, and crash
- * recovery. Fire-and-forget — replies flow back via the onText callback,
- * not via this function's return value.
+ * recovery. Replies still flow via onText, while the returned receipt keeps the
+ * inbound journal at dispatched until Claude reports a real turn-end.
  */
-async function daemonDispatch(threadIdStr: string, ev: InboundMessageEvent): Promise<void> {
+async function daemonDispatch(threadIdStr: string, ev: InboundMessageEvent): Promise<InboundHandlerResult> {
   const text = ev.text;
   if (!text) return;
   if (!daemonRegistry) {
@@ -932,9 +1022,12 @@ async function daemonDispatch(threadIdStr: string, ev: InboundMessageEvent): Pro
   const ack = isReactable(transport)
     ? await transport.setDeliveredAck(ev.messageRef)
     : null;
-  if (ack) trackPendingRead(threadIdStr, ack);
-
-  daemonRegistry!.enqueue(threadIdStr, text);
+  const completion = daemonRegistry!.enqueueWithReceipt(threadIdStr, text, {
+    onAccepted: ack && isReactable(transport)
+      ? () => { void transport.setReadAcks([ack]); }
+      : undefined,
+  });
+  return { completion };
 }
 
 /** Public API for cta / Pager IPC — kill the daemon for a topic so the
@@ -1204,7 +1297,7 @@ export async function handleMyChatMember(mcm: TgChatMemberUpdated): Promise<void
   process.stdout.write(`[${new Date().toISOString()}] pair intro sent: chat=${mcm.chat.id} inviter=${mcm.from.id}${isGroup ? " (group)" : ""}\n`);
 }
 
-export async function onButtonPress(ev: ButtonPressEvent): Promise<void> {
+export async function onButtonPress(ev: ButtonPressEvent): Promise<InboundHandlerResult> {
   // answerCallback (dismiss the tap's spinner) is genuinely Telegram-only — the
   // normalized event doesn't model it, so reach the query id via raw. cb.message
   // (the prompt) likewise survives only on raw: we echo its text + drop its
@@ -1214,7 +1307,7 @@ export async function onButtonPress(ev: ButtonPressEvent): Promise<void> {
   const data = ev.label;
   const dest = ev.address;
   if (!data) { await answerCallback(cb.id); return; }
-  const isPairedUser = !!pairedCache && ev.from.id === String(pairedCache.user_id);
+  const isPairedUser = isAuthorizedInbound(ev);
 
   // Inline-keyboard answer to a buttons-marker prompt. callback_data shape:
   // `ans:<thread_id>:<label>`. We synthesize a normalized message event carrying
@@ -1239,7 +1332,7 @@ export async function onButtonPress(ev: ButtonPressEvent): Promise<void> {
     void editMessageText(cb.message.chat.id, cb.message.message_id, `${originalText}\n\n↳ ${label}`);
     // Re-inject the chosen label as the user's next message through the shared
     // normalized pipeline (replaces the old synthetic-TgUpdate → dispatchUpdate).
-    await onInboundMessage({
+    return onInboundMessage({
       kind: "message",
       routingKey: ev.routingKey,
       address: ev.address,
@@ -1248,7 +1341,6 @@ export async function onButtonPress(ev: ButtonPressEvent): Promise<void> {
       messageRef: ev.messageRef,
       raw: ev.raw,
     });
-    return;
   }
 
   // P6a: mount-choice button (`mnt:<thread>:<idx>`) — link the topic to the
@@ -1448,6 +1540,43 @@ async function idleFlushAndClear(threadIdStr: string): Promise<void> {
   }
 }
 
+/** One resource-governance pass, extracted verbatim from the housekeeping
+ * timer. Candidate selection, ordering, detached large-session flushes and the
+ * soft idle-only warm cap intentionally retain their current semantics. */
+async function sweepResources(): Promise<void> {
+  // Idle sweep (opt-in): large transcript → detached flush + clear; small or
+  // missing transcript → evict only while preserving the session UUID.
+  if (daemonRegistry && idleEvictMinutes > 0) {
+    for (const threadIdStr of daemonRegistry.idleCandidates(idleEvictMinutes * 60_000)) {
+      if (idleFlushing.has(threadIdStr)) continue;
+      const key: number | "dm" = threadIdStr === "dm" ? "dm" : Number(threadIdStr);
+      const mount = mountsCache.get(tgKey(key));
+      const jsonl = mount ? jsonlPathForMount(mount) : null;
+      let bytes = 0;
+      if (jsonl) { try { bytes = statSync(jsonl).size; } catch { /* missing → 0 */ } }
+      if (bytes > IDLE_CLEAR_MIN_BYTES) {
+        void idleFlushAndClear(threadIdStr);
+      } else {
+        if (!daemonRegistry.isIdleEmpty(threadIdStr)) continue;
+        await daemonRegistry.resetTopic(threadIdStr);
+        process.stdout.write(`[${new Date().toISOString()}] evicted idle daemon ${threadIdStr} after ${idleEvictMinutes}m (session ${bytes}B ≤ ${IDLE_CLEAR_MIN_BYTES}B)\n`);
+      }
+    }
+  }
+
+  // Independent warm-process cap. Busy work is never selected, so this is a
+  // soft cap when every excess daemon is active.
+  if (daemonRegistry && MAX_WARM_DAEMONS > 0) {
+    for (const threadIdStr of daemonRegistry.overCapacityIdleCandidates(MAX_WARM_DAEMONS)) {
+      if (!daemonRegistry.isIdleEmpty(threadIdStr)) continue;
+      await daemonRegistry.resetTopic(threadIdStr);
+      process.stdout.write(`[${new Date().toISOString()}] evicted idle daemon ${threadIdStr} to enforce max_warm_daemons=${MAX_WARM_DAEMONS}\n`);
+    }
+  }
+}
+
+const resourceGovernor: ResourceGovernor = { sweep: sweepResources };
+
 // /clear over Telegram: rotate the per-topic session UUID and kill the
 // topic's tmux session. The watchdog (kick_dead_topic_sessions) and the
 // wrapper's restart loop respawn claude with the new UUID, so the next
@@ -1634,9 +1763,8 @@ async function handleStop(ev: InboundMessageEvent): Promise<void> {
 
   // The aborted turn emits no turn-end, so onDaemonTurnEnd's clearTypingExternal
   // never fires — clear the typing indicator here so it doesn't keepalive to its
-  // cap. (Read-ack glyphs need no handling: onDaemonFlush already flipped the
-  // in-flight turn's messages to 👌 at flush time; messages queued during the
-  // turn keep their 👀 and flip naturally when the resumed turn flushes.)
+  // cap. (Read-ack glyphs need no handling: each accepted registry prompt has
+  // already flipped to 👌; queued messages keep 👀 until their own stdin write.)
   if (isTyping(transport)) {
     void transport.clearTypingExternal(dest);
   }
@@ -1761,30 +1889,16 @@ async function handlePair(ev: InboundMessageEvent, args: string): Promise<void> 
  * picking up the new paired.json's chat_id. We also kill any leftover
  * `topic-*` tmux sessions from a stale pre-Phase-4 install (defensive). */
 async function resetPerTopicStateOnPairSwitch(): Promise<void> {
-  // Snapshot any in-flight queues before shutdown — otherwise a pair switch
-  // mid-conversation silently drops the user's pending text. Map<threadId, []>
-  // captures every non-empty queue across topics; we replay each into the
-  // fresh registry below so respawn picks them up with the new chat_id.
-  const queueSnapshot = new Map<string, string[]>();
   if (daemonRegistry) {
-    for (const [threadId, queue] of daemonRegistry.snapshotQueues()) {
-      if (queue.length > 0) queueSnapshot.set(threadId, queue);
-    }
     // Shut down all daemons — they hold the old chat_id in their MCP env.
     // shutdown() awaits SIGTERM completion so claude releases its session
-    // lock file cleanly before the next message re-spawns it.
+    // lock file cleanly before the next message re-spawns it. Pending/in-flight
+    // old-chat receipts reject to outcome-unknown and are deliberately NOT
+    // replayed into the new chat: topic IDs can collide across groups, and an
+    // untracked replay could leak or duplicate old-chat work.
     await daemonRegistry.shutdown();
+    daemonRegistry = null;
     initDaemonRegistry(); // fresh registry, lazy respawn on next enqueue
-    // Replay snapshotted messages into the new registry. Each enqueue arms
-    // the debounce; the first inbound after pair switch combines with any
-    // recovered text. Order within each topic is preserved.
-    if (daemonRegistry !== null) {
-      for (const [threadId, queue] of queueSnapshot) {
-        for (const text of queue) {
-          (daemonRegistry as ClaudeDaemonRegistry).enqueue(threadId, text);
-        }
-      }
-    }
   }
 }
 
@@ -2046,37 +2160,58 @@ async function handleHiddenTuiCommand(ev: InboundMessageEvent, command: string, 
   );
 }
 
+/** Existing translated/hidden Claude TUI command table behind the BotFeature
+ * consumption contract. Bootstrap, authorization and direct bot commands stay
+ * in the outer dispatcher because their priority is security-sensitive. */
+const tuiBotFeature: BotFeature<InboundMessageEvent> = {
+  id: "claude-tui-commands",
+  commands: Object.keys(TUI_COMMANDS),
+  async tryHandle({ event, command }): Promise<boolean> {
+    const spec = TUI_COMMANDS[command];
+    if (spec?.disposition === "translated") {
+      await spec.handler(event);
+      return true;
+    }
+    if (spec?.disposition === "hidden") {
+      await handleHiddenTuiCommand(event, command, spec.reason);
+      return true;
+    }
+    return false;
+  },
+};
+
 /**
  * Attempt to handle a message as an in-chat command. Returns true if the
  * message was consumed by command handling (so normal tmux dispatch should
  * be skipped). Returns false to fall through to normal routing.
  *
  * Pre-pair: only /pair is accepted from any chat. Everything else returns
- * false (which then drops because there's no MAIN_CHAT_ID yet).
+ * false (which then drops because the bot is not paired yet).
  * Post-pair: only the paired user_id gets commands honored; others fall
  * through. Unknown /commands also fall through (claude can handle them)
  * except for the blocklist of UI-only built-ins.
  */
 async function tryHandleCommand(ev: InboundMessageEvent): Promise<boolean> {
-  const text = ev.text;
-  if (!text.startsWith("/")) return false;
-  // `/pair@MyBot AB7K-...` → strip @-suffix from command word
-  const firstSpace = text.indexOf(" ");
-  const head = firstSpace < 0 ? text : text.slice(0, firstSpace);
-  const command = head.split("@")[0].toLowerCase();
-  const args = firstSpace < 0 ? "" : text.slice(firstSpace + 1);
+  const parsed = parseBotCommand(ev.text);
+  if (!parsed) return false;
+  const { command, args } = parsed;
 
   // Pre-pair: only /start and /pair are meaningful. Everything else falls
-  // through (which then drops because there's no MAIN_CHAT_ID yet).
-  if (!pairedCache && !ENV_MAIN_CHAT_ID) {
+  // through (which then drops because there is no paired authorization yet).
+  if (!pairedCache) {
     if (command === "/pair") { await handlePair(ev, args); return true; }
     if (command === "/start") { await handleStart(ev); return true; }
     return false;
   }
 
-  // Post-pair authorization: paired user_id only. ev.from.id is the stringified
-  // sender id; the stored user_id is numeric, so compare as strings.
-  if (pairedCache && ev.from.id !== String(pairedCache.user_id)) {
+  // The paired operator may move the bot to a new chat with `/pair`; user_id is
+  // the durable identity for that one command. Every other command requires the
+  // current chat_id and user_id together.
+  if (command === "/pair" && ev.from.id === String(pairedCache.user_id)) {
+    await handlePair(ev, args);
+    return true;
+  }
+  if (!isAuthorizedInbound(ev)) {
     // Silently drop — don't reveal command surface to unauthorized users.
     return command.startsWith("/"); // claim handled to suppress claude dispatch
   }
@@ -2095,20 +2230,10 @@ async function tryHandleCommand(ev: InboundMessageEvent): Promise<boolean> {
     case "/do":    await handleDo(ev, args); return true;
     case "/task":  await handleTask(ev, args); return true;
     case "/help":  await handleHelp(ev); return true;
-    default: {
-      // TUI command framework: translated → run handler, hidden → reply,
-      // forwarded (no entry) → fall through to claude.
-      const spec = TUI_COMMANDS[command];
-      if (spec?.disposition === "translated") {
-        await spec.handler(ev);
-        return true;
-      }
-      if (spec?.disposition === "hidden") {
-        await handleHiddenTuiCommand(ev, command, spec.reason);
-        return true;
-      }
-      return false; // unknown /x → let claude see it (user skills etc.)
-    }
+    default:
+      // TUI translated/hidden commands consume; unknown /x falls through to
+      // claude so user-defined skills keep working.
+      return tuiBotFeature.tryHandle({ event: ev, command, args });
   }
 }
 
@@ -2146,8 +2271,8 @@ function refreshMountsIfChanged(): void {
  *   - forum topic → mount with thread_id == msg.message_thread_id
  *   - DM (no thread_id) → mount with thread_id == "dm"
  *
- * Chat-level allowlist (MAIN_CHAT_ID) is enforced first — replaces the
- * official plugin's allowFrom semantics in v0.
+ * paired.json's chat_id AND user_id are enforced together. There is no
+ * chat-only fallback because a group chat id is not an identity boundary.
  */
 /**
  * Persist a wildcard-derived mount for a thread_id that hit the `*` template.
@@ -2186,7 +2311,7 @@ async function routeMessage(ev: InboundMessageEvent): Promise<string | null> {
     process.stderr.write(`poller: drop msg from chat=${chatId} user=${fromId} thread=${threadLabel} text=${JSON.stringify(ev.text.slice(0, 40))} reason=${reason}\n`);
   const expectedChat = effectiveChatId();
   if (expectedChat == null) {
-    dropLog("unpaired-no-env");
+    dropLog("unpaired");
     return null;
   }
   if (String(chatId) !== expectedChat) {
@@ -2197,7 +2322,7 @@ async function routeMessage(ev: InboundMessageEvent): Promise<string | null> {
   // claude. effectiveUserId is numeric; ev.from.id is stringified — compare as
   // strings.
   const expectedUser = effectiveUserId();
-  if (expectedUser != null && fromId !== String(expectedUser)) {
+  if (expectedUser == null || fromId !== String(expectedUser)) {
     dropLog(`wrong-user (expected ${expectedUser})`);
     return null;
   }
@@ -2239,7 +2364,12 @@ async function promptMountChoice(thread_id: number | "dm", chat_id: number, thre
     return;
   }
   const buttons = cands.map((p, i) => [{ text: mountBasename(p), callback_data: `mnt:${tid}:${i}` }]);
-  await sendInlineKeyboard(chat_id, "This topic isn't linked to a project yet. Pick one, or send `/mount <path>`:", buttons);
+  await outboundQueue.enqueue({
+    kind: "buttons",
+    to: tgAddr(chat_id, threadIdRaw),
+    text: "This topic isn't linked to a project yet. Pick one, or send `/mount <path>`:",
+    buttons: buttons.flat().map((button) => ({ label: button.text, action: button.callback_data })),
+  });
 }
 
 /** Topic-name harvest from a normalized topic-created/topic-renamed event. The
@@ -2263,13 +2393,13 @@ function recordTopicNameFromEvent(
 // onInboundMessage sees only message-kind events. No raw Telegram fields — every
 // field comes from the normalized event (text/address/routingKey/from/messageRef),
 // so a second platform routes through the identical code.
-async function onInboundMessage(ev: InboundMessageEvent): Promise<void> {
+async function onInboundMessage(ev: InboundMessageEvent): Promise<InboundHandlerResult> {
   // Agentic Edit capture: if the user tapped Edit on an approval card, their next
   // plain (non-command) message in that topic is the corrected params. Consume it
   // as the gate decision and stop — don't route it to the daemon. Only the paired
   // user can drive an edit (mirrors tryHandleCommand's gate).
   if (pendingAgenticEdit && ev.text && !ev.text.startsWith("/")
-      && (!pairedCache || ev.from.id === String(pairedCache.user_id))) {
+      && isAuthorizedInbound(ev)) {
     const pe = pendingAgenticEdit;
     if (Date.now() > pe.expiresAt) {
       pendingAgenticEdit = null; // stale → fall through to normal handling
@@ -2282,7 +2412,7 @@ async function onInboundMessage(ev: InboundMessageEvent): Promise<void> {
     }
   }
 
-  // Commands run first. Pre-pair /pair messages bypass MAIN_CHAT_ID gating
+  // Commands run first. Pre-pair /pair messages bypass paired-state gating
   // (that's the whole point — we don't know the chat yet). Post-pair commands
   // are gated by paired user_id inside tryHandleCommand.
   if (await tryHandleCommand(ev)) return;
@@ -2302,7 +2432,7 @@ async function onInboundMessage(ev: InboundMessageEvent): Promise<void> {
     return;
   }
   const expectedUser = effectiveUserId();
-  if (expectedUser != null && ev.from.id !== String(expectedUser)) {
+  if (expectedUser == null || ev.from.id !== String(expectedUser)) {
     void routeMessage(ev);
     return;
   }
@@ -2331,10 +2461,13 @@ async function onInboundMessage(ev: InboundMessageEvent): Promise<void> {
   // The registry owns spawn-if-needed, 2s debounce, per-topic queue, and
   // crash respawn. Reply text streams back asynchronously via the
   // postTelegramTextFromDaemon callback wired in initDaemonRegistry().
-  // Fire-and-forget: daemonDispatch awaits the delivered-ack internally before
-  // enqueue, but the caller need not block on it.
-  void daemonDispatch(ev.routingKey, ev);
+  // Return the registry receipt through the transport boundary. Polling stays
+  // non-blocking (so follow-up messages can steer), but the durable journal is
+  // completed only after Claude emits turn-end. Crash/kill/send failures leave
+  // the input outcome-unknown instead of silently losing a completed record.
+  const result = await daemonDispatch(ev.routingKey, ev);
   process.stdout.write(`[${new Date().toISOString()}] msg → daemon[${ev.routingKey}] (${text0.length} chars)\n`);
+  return result;
 }
 
 
@@ -2453,8 +2586,16 @@ function approvalDispatch(): void {
     if (req.status === "sent" || approvalsSent.has(req.id)) continue;
     approvalsSent.add(req.id); // sync guard so the next 5s tick can't double-send
     const threadIdNum = req.threadId === "dm" ? undefined : Number(req.threadId);
-    void sendInlineKeyboard(req.chatId, renderApprovalCard(req), approvalButtonRows(req.id), threadIdNum)
-      .then((res) => { if (res) markSent(APPROVALS_DIR, req.id); else approvalsSent.delete(req.id); })
+    const buttons = approvalButtonRows(req.id).flat()
+      .map((button) => ({ label: button.text, action: button.callback_data }));
+    void outboundQueue.enqueueTracked({
+      kind: "buttons",
+      to: tgAddr(req.chatId, threadIdNum),
+      text: renderApprovalCard(req),
+      buttons,
+      deliveryKey: `approval:${req.id}`,
+    })
+      .then(() => { markSent(APPROVALS_DIR, req.id); })
       .catch(() => { approvalsSent.delete(req.id); });
   }
 }
@@ -2918,6 +3059,7 @@ export async function main(): Promise<void> {
       process.stdout.write(`[${new Date().toISOString()}] poller: ${sig} received — shutting down daemons\n`);
       void (async () => {
         if (daemonRegistry) await daemonRegistry.shutdown();
+        await outboundQueue.stop();
         process.exit(0);
       })();
     });
@@ -2949,6 +3091,24 @@ export async function main(): Promise<void> {
   refreshPairedIfChanged();
   refreshSettingsIfChanged();
   initDaemonRegistry();
+  const stopReliabilitySampling = reliabilityMonitor.startSampling({
+    queueDepths: () => {
+      const daemonPending = daemonRegistry?.snapshotQueues()
+        .reduce((total, [, queue]) => total + queue.length, 0) ?? 0;
+      const deliveryDepths = typeof (transport as ChatTransport & {
+        deliveryQueueDepths?: () => Record<string, number>;
+      }).deliveryQueueDepths === "function"
+        ? (transport as ChatTransport & {
+          deliveryQueueDepths: () => Record<string, number>;
+        }).deliveryQueueDepths()
+        : {};
+      return {
+        "daemon.pending": daemonPending,
+        "outbound.pending": outboundQueue.depth(),
+        ...deliveryDepths,
+      };
+    },
+  });
   startInjectWatcher();
   await processInjectFlags(); // drain anything dropped before this poller started
   // File-access (FDA) self-probe: we're in the launchd TCC context here, so this
@@ -2965,6 +3125,10 @@ export async function main(): Promise<void> {
 
   const startupChat = effectiveChatId() ?? "(unpaired — awaiting /pair)";
   process.stdout.write(`[${new Date().toISOString()}] poller starting (Phase 4 daemon mode), offset=${offset}, chat=${startupChat}, mounts=${mountsCache.size}\n`);
+  // Seed liveness once at boot. Subsequent touches come only from successful
+  // transport reads, so a wedged inbound socket eventually goes stale and the
+  // watchdog can restart the process.
+  touchHeartbeat();
 
   // ── Housekeeping off the poll cadence ──────────────────────────────────────
   // P3a: transport.start() below owns the inbound long-poll loop (it blocks on
@@ -2991,7 +3155,6 @@ export async function main(): Promise<void> {
             process.stdout.write(`[${new Date().toISOString()}] wake-flag observed → forced inbound retry\n`);
           }
         }
-        touchHeartbeat();
         refreshMountsIfChanged();
         refreshPairedIfChanged();
         refreshSettingsIfChanged();
@@ -3010,28 +3173,8 @@ export async function main(): Promise<void> {
           lastFileAccessProbe = Date.now();
           runFileAccessProbe(STATE_DIR);
         }
-        // Idle sweep (opt-in): for each topic quiet ≥ N min, decide by size.
-        // Large transcript → flush durable memory then clear (rotate UUID →
-        // fresh, cheap session); the flush runs DETACHED so a slow turn never
-        // stalls this tick. Small transcript → evict only (resetTopic keeps the
-        // UUID → next message --resumes, RAM reclaim, no context loss).
-        // No-op unless the operator set a threshold.
-        if (daemonRegistry && idleEvictMinutes > 0) {
-          for (const threadIdStr of daemonRegistry.idleCandidates(idleEvictMinutes * 60_000)) {
-            if (idleFlushing.has(threadIdStr)) continue;
-            const key: number | "dm" = threadIdStr === "dm" ? "dm" : Number(threadIdStr);
-            const mount = mountsCache.get(tgKey(key));
-            const jsonl = mount ? jsonlPathForMount(mount) : null;
-            let bytes = 0;
-            if (jsonl) { try { bytes = statSync(jsonl).size; } catch { /* missing → 0 */ } }
-            if (bytes > IDLE_CLEAR_MIN_BYTES) {
-              void idleFlushAndClear(threadIdStr); // detached — must not block the tick
-            } else {
-              await daemonRegistry.resetTopic(threadIdStr);
-              process.stdout.write(`[${new Date().toISOString()}] evicted idle daemon ${threadIdStr} after ${idleEvictMinutes}m (session ${bytes}B ≤ ${IDLE_CLEAR_MIN_BYTES}B)\n`);
-            }
-          }
-        }
+        await resourceGovernor.sweep();
+        reliabilityGate.evaluate(reliabilityMonitor.snapshot());
         // β handoff release/reacquire flags + watch-live inject. fs.watch
         // handles immediacy; this is the steady-state fallback drain.
         await processReleaseFlags();
@@ -3058,6 +3201,9 @@ export async function main(): Promise<void> {
       case "transport-degraded":
         process.stderr.write(`poller: transport degraded: ${ev.reason}\n`);
         return;
+      case "transport-progress":
+        touchHeartbeat();
+        return;
       case "topic-created":
       case "topic-renamed":
         recordTopicNameFromEvent(ev);
@@ -3069,15 +3215,18 @@ export async function main(): Promise<void> {
         return;
       }
       case "button-press":
-        await onButtonPress(ev);
-        return;
+        return onButtonPress(ev);
       case "message":
-        await onInboundMessage(ev);
-        return;
+        return onInboundMessage(ev);
     }
   });
-  await transport.start({});
-  clearInterval(housekeepTimer); // unreachable in steady state (start() blocks)
+  try {
+    await transport.start({});
+  } finally {
+    clearInterval(housekeepTimer); // normally unreachable (start() blocks)
+    stopReliabilitySampling();
+    await outboundQueue.stop();
+  }
 }
 
 // Tests import this module to drive command handlers directly. Only run the
@@ -3104,6 +3253,8 @@ export {
   refreshMountsIfChanged,
   effectiveChatId,
   effectiveUserId,
+  isAuthorizedInbound,
+  routeMessage,
   effortArg,
   type TgMessage,
   type InboundMessageEvent,

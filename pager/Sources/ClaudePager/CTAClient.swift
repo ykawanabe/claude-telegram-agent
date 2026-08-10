@@ -586,9 +586,9 @@ enum CTAClient {
     /// Mirrors $STATE_DIR/settings.json. Read directly from disk (like
     /// pairedState) because it's a tiny file the UI needs at render time and a
     /// cta roundtrip isn't worth it. Writes go through `setIdleEvict` /
-    /// `setInterruptSteer` — cta owns STATE_DIR. `idle_evict_minutes` of 0 /
-    /// absent = eviction disabled. `interrupt_on_message` absent = on (matches
-    /// the poller's default).
+    /// `setInterruptSteer` — cta owns STATE_DIR. `idle_evict_minutes` of 0
+    /// disables eviction; absent = the recommended 15-minute default.
+    /// `interrupt_on_message` absent = on (matches the poller's default).
     struct SettingsJSON: Decodable, Equatable {
         let idleEvictMinutes: Int?
         let interruptOnMessage: Bool?
@@ -627,14 +627,15 @@ enum CTAClient {
     /// Pinned agentic reasoning effort, nil when unset (claude default applies).
     static func agenticEffort() -> String? { readSettings()?.agenticEffort }
 
-    /// Current idle-eviction threshold in minutes (0 = disabled / unset /
-    /// unreadable). Reads $STATE_DIR/settings.json directly.
+    /// Current idle-eviction threshold in minutes (0 = explicitly disabled;
+    /// missing/unreadable = recommended 15-minute default). Reads
+    /// $STATE_DIR/settings.json directly.
     static func idleEvictMinutes() -> Int {
         let path = "\(stateDir)/settings.json"
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let decoded = try? JSONDecoder().decode(SettingsJSON.self, from: data)
-        else { return 0 }
-        return max(0, decoded.idleEvictMinutes ?? 0)
+        else { return 15 }
+        return max(0, decoded.idleEvictMinutes ?? 15)
     }
 
     /// Whether mid-turn auto-steer is enabled (default true when the key is

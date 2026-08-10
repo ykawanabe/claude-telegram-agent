@@ -129,6 +129,29 @@ function msg(args: {
 }
 
 describe("pre-pair state", () => {
+  test("legacy MAIN_CHAT_ID alone is ignored (chat-only auth fails closed)", () => {
+    process.env.MAIN_CHAT_ID = "-1001";
+    try {
+      const ev = msg({ text: "hello", chat_id: -1001, from_id: 99 });
+      expect(poller.effectiveChatId()).toBeNull();
+      expect(poller.effectiveUserId()).toBeNull();
+      expect(poller.isAuthorizedInbound(ev)).toBe(false);
+    } finally {
+      delete process.env.MAIN_CHAT_ID;
+    }
+  });
+
+  test("paired.json without a valid user_id is rejected", () => {
+    writeFileSync(PAIRED_STATE_FILE, JSON.stringify({
+      version: 1,
+      chat_id: -1001,
+      paired_at: new Date().toISOString(),
+    }));
+    poller.refreshPairedIfChanged();
+    expect(poller.effectiveChatId()).toBeNull();
+    expect(poller.effectiveUserId()).toBeNull();
+  });
+
   test("/pair with correct code claims chat + writes paired.json + consumes code", async () => {
     writeFileSync(PAIRING_CODE_FILE, "ABCD-EFGH\n");
     poller.refreshPairedIfChanged();

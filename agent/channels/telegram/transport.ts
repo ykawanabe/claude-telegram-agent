@@ -26,16 +26,14 @@
  * = what this adapter version has wired. The two axes are intentionally distinct.
  */
 
-import { openSync, closeSync, writeFileSync, fsyncSync, renameSync, readFileSync } from "node:fs";
+import { openSync, closeSync, writeFileSync, fsyncSync, renameSync, readFileSync, mkdirSync, readdirSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
   getUpdates,
   getMe,
-  sendText as wireSendText,
   setReaction,
   editMessageText as wireEditMessageText,
-  sendInlineKeyboard,
   sendChatAction,
   type TgUpdate,
   type TgMessage,
@@ -55,9 +53,18 @@ import type {
   RoutingKey,
   SenderId,
   InboundEvent,
+  InboundHandlerResult,
+  InboundJournal,
+  OutboundButton,
   AckHandle,
   TypingToken,
 } from "../types";
+import { TelegramOutboundSender } from "../../delivery/outbound";
+import {
+  FileInboundJournal,
+  inboundJournalModeFromEnv,
+  type InboundAdmission,
+} from "../../delivery/inbound";
 
 /** Telegram's documented free-bot reaction whitelist (non-premium bots may only
  *  react with these standard emoji; custom emoji needs Premium / chat-admin).
@@ -76,6 +83,49 @@ const READ_REACTION_EMOJI = "👌";
 
 /** Telegram plain-text message hard limit. sendText chunks above this. */
 const TG_TEXT_MAX_CHARS = 4096;
+
+/** Filesystem implementation of the platform-neutral inbound hand-off. */
+class LegacyTelegramInboundInbox implements InboundJournal<TgUpdate, number> {
+  constructor(private readonly inboxDir: string) {}
+
+  private path(updateId: number): string {
+    return join(this.inboxDir, `${updateId}.json`);
+  }
+
+  persist(update: TgUpdate): void {
+    mkdirSync(this.inboxDir, { recursive: true, mode: 0o700 });
+    const path = this.path(update.update_id);
+    const tmp = `${path}.tmp.${process.pid}`;
+    const fd = openSync(tmp, "w", 0o600);
+    try {
+      writeFileSync(fd, `${JSON.stringify(update)}\n`);
+      fsyncSync(fd);
+    } finally { closeSync(fd); }
+    renameSync(tmp, path);
+  }
+
+  listPending(): TgUpdate[] {
+    let names: string[];
+    try { names = readdirSync(this.inboxDir); } catch { return []; }
+    const updates: TgUpdate[] = [];
+    for (const name of names.filter((n) => /^\d+\.json$/.test(n)).sort((a, b) => Number(a.slice(0, -5)) - Number(b.slice(0, -5)))) {
+      const path = join(this.inboxDir, name);
+      try {
+        const update = JSON.parse(readFileSync(path, "utf8")) as TgUpdate;
+        if (!Number.isSafeInteger(update.update_id) || update.update_id < 0) throw new Error("invalid update_id");
+        updates.push(update);
+      } catch (e) {
+        process.stderr.write(`telegram: corrupt inbox record ${name}: ${e instanceof Error ? e.message : String(e)} (discarded)\n`);
+        try { unlinkSync(path); } catch { /* raced cleanup */ }
+      }
+    }
+    return updates;
+  }
+
+  remove(updateId: number): void {
+    try { unlinkSync(this.path(updateId)); } catch { /* already absent */ }
+  }
+}
 
 /** A Telegram ack handle: enough to flip the reaction later (N:1 flush). */
 interface TgAckHandle {
@@ -133,10 +183,21 @@ export class TelegramTransport
   // overlaps) + a hard cap so a loop can't spin forever if the marker is never
   // cleared. The on-disk marker also powers Pager's isGenerating.
   private readonly stateDir = stateDir();
+  private readonly legacyInboundInbox: InboundJournal<TgUpdate, number> =
+    new LegacyTelegramInboundInbox(join(this.stateDir, "inbound-inbox"));
+  private readonly inboundJournal = new FileInboundJournal<TgUpdate>({
+    rootDir: join(this.stateDir, "delivery", "inbound"),
+    mode: inboundJournalModeFromEnv(),
+  });
   private readonly typingIntervalMs = Number(process.env.TYPING_INTERVAL_MS ?? "4000");
   private readonly typingMaxMs = Number(process.env.TYPING_MAX_MS ?? `${10 * 60_000}`);
+  private readonly emptyPollBackoffMs = (() => {
+    const n = Number(process.env.EMPTY_POLL_BACKOFF_MS ?? "100");
+    return Number.isFinite(n) && n >= 0 ? n : 100;
+  })();
+  private readonly outboundSender = new TelegramOutboundSender();
 
-  private handler: ((e: InboundEvent) => Promise<void>) | null = null;
+  private handler: ((e: InboundEvent) => Promise<InboundHandlerResult>) | null = null;
   private running = false;
   // The AbortController for the *current* getUpdates iteration. Created fresh
   // per long-poll, cleared on iteration end. interruptInbound() flips this so
@@ -146,17 +207,19 @@ export class TelegramTransport
 
   // ─── required core ─────────────────────────────────────────────────────────
 
-  onEvent(handler: (e: InboundEvent) => Promise<void>): void {
+  onEvent(handler: (e: InboundEvent) => Promise<InboundHandlerResult>): void {
     this.handler = handler;
   }
 
-  /** Drive the long-poll loop: getUpdates → persist offset BEFORE dispatch
-   *  (drop-not-double-deliver durability contract) → normalize → handler.
+  /** Drive the long-poll loop: getUpdates → durable inbox → advance offset →
+   *  normalize/dispatch → delete inbox record. Persisting work before the
+   *  offset prevents a crash from silently dropping an already-confirmed batch.
    *  Each iteration carries its own AbortController so external code
    *  (poller's wake-flag housekeep) can abort the in-flight fetch. */
   async start(_opts: { publicUrl?: string }): Promise<void> {
     this.running = true;
     let offset = this.readOffset();
+    offset = await this.recoverInbound(offset);
     while (this.running) {
       this.currentPollAbort = new AbortController();
       let updates: TgUpdate[];
@@ -176,23 +239,30 @@ export class TelegramTransport
       } finally {
         this.currentPollAbort = undefined;
       }
-      if (updates.length === 0) continue;
-      const maxId = updates[updates.length - 1].update_id;
+      await this.handler?.({ kind: "transport-progress" });
+      if (updates.length === 0) {
+        if (this.emptyPollBackoffMs > 0) await new Promise((r) => setTimeout(r, this.emptyPollBackoffMs));
+        continue;
+      }
+      const admissions: Array<[TgUpdate, InboundAdmission<TgUpdate>]> = [];
+      for (const update of updates) {
+        // Shadow keeps the old inbox byte-for-byte so the new journal can be
+        // compared without changing crash replay. Enforced makes the state
+        // machine authoritative and therefore does not need the legacy copy.
+        if (this.inboundJournal.mode === "shadow") this.legacyInboundInbox.persist(update);
+        admissions.push([
+          update,
+          this.inboundJournal.receive({
+            messageId: String(update.update_id),
+            payload: update,
+          }),
+        ]);
+      }
+      const maxId = Math.max(...updates.map((u) => u.update_id));
       this.writeOffset(maxId + 1);
       offset = maxId + 1;
-      for (const u of updates) {
-        // One poison update must not tear down the whole poll loop (which would
-        // hit the top-level process.exit and rely on launchd to respawn). The
-        // offset was already advanced above, so a throwing update is skipped on
-        // the next iteration rather than reprocessed.
-        try {
-          const ev = normalizeUpdate(u);
-          if (ev && this.handler) await this.handler(ev);
-        } catch (e) {
-          process.stderr.write(
-            `[${new Date().toISOString()}] inbound dispatch error (update ${u.update_id}, skipped): ${e instanceof Error ? (e.stack ?? e.message) : String(e)}\n`,
-          );
-        }
+      for (const [update, admission] of admissions) {
+        await this.dispatchJournaledUpdate(update, admission);
       }
     }
   }
@@ -207,6 +277,168 @@ export class TelegramTransport
 
   async stop(): Promise<void> {
     this.running = false;
+    this.currentPollAbort?.abort();
+  }
+
+  private async recoverInbound(offset: number): Promise<number> {
+    const legacy = this.legacyInboundInbox.listPending();
+    const recovery = this.inboundJournal.recoverAfterCrash();
+    const recoveredUpdates = [
+      ...recovery.replayable.map((entry) => entry.payload),
+      ...recovery.uncertain.map((record) => record.payload),
+      ...legacy,
+    ];
+    if (recoveredUpdates.length === 0) return offset;
+    const recoveredOffset = Math.max(offset, Math.max(...recoveredUpdates.map((u) => u.update_id)) + 1);
+    if (recoveredOffset !== offset) this.writeOffset(recoveredOffset);
+
+    // Legacy records are also the migration path for installations upgraded
+    // from the Phase-0 inbox. Prefer the durable record when it is replayable;
+    // terminal records go through receive() so shadow records the comparison
+    // and enforced suppresses/holds them.
+    const legacyIds = new Set(legacy.map((update) => update.update_id));
+    for (const update of legacy) {
+      const existing = this.inboundJournal.get(String(update.update_id));
+      if (existing?.state === "received") {
+        await this.dispatchManagedUpdate(update);
+      } else {
+        const admission = this.inboundJournal.receive({
+          messageId: String(update.update_id),
+          payload: update,
+        });
+        await this.dispatchJournaledUpdate(update, admission);
+      }
+    }
+    for (const entry of recovery.replayable) {
+      if (!legacyIds.has(entry.payload.update_id)) await this.dispatchManagedUpdate(entry.payload);
+    }
+    return recoveredOffset;
+  }
+
+  private async dispatchJournaledUpdate(
+    update: TgUpdate,
+    admission: InboundAdmission<TgUpdate>,
+  ): Promise<void> {
+    if (admission.action !== "process") {
+      this.legacyInboundInbox.remove(update.update_id);
+      process.stdout.write(
+        `[${new Date().toISOString()}] inbound ${admission.action} (update ${update.update_id}, ${admission.classification})\n`,
+      );
+      return;
+    }
+    if (admission.managed) {
+      await this.dispatchManagedUpdate(update);
+      return;
+    }
+    // Shadow duplicate/unknown: intentionally exercise the legacy path while
+    // leaving the first durable record untouched for comparison.
+    try {
+      const ev = normalizeUpdate(update);
+      const result = ev && this.handler ? await this.handler(ev) : undefined;
+      if (result) {
+        // Shadow intentionally leaves the original durable record untouched,
+        // but a deferred daemon receipt must still have a rejection consumer.
+        // Otherwise a later crash/reset becomes an unhandled rejection.
+        void result.completion.catch((error) => {
+          process.stderr.write(
+            `[${new Date().toISOString()}] shadow inbound deferred outcome unknown (update ${update.update_id}): ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
+          );
+        });
+      }
+    } catch (e) {
+      // Poison updates are explicitly discarded after logging; transient process
+      // death leaves the record on disk and it is replayed on the next start.
+      process.stderr.write(
+        `[${new Date().toISOString()}] inbound dispatch error (update ${update.update_id}, discarded): ${e instanceof Error ? (e.stack ?? e.message) : String(e)}\n`,
+      );
+    }
+    this.legacyInboundInbox.remove(update.update_id);
+  }
+
+  private async dispatchManagedUpdate(update: TgUpdate): Promise<void> {
+    const messageId = String(update.update_id);
+    const claim = this.inboundJournal.claim(messageId, `telegram-poller:${process.pid}`);
+    const claimToken = claim.claim!.token;
+    let event: InboundEvent | null;
+    try {
+      event = normalizeUpdate(update);
+    } catch (error) {
+      this.inboundJournal.markLost(
+        messageId,
+        claimToken,
+        `normalization failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      this.legacyInboundInbox.remove(update.update_id);
+      return;
+    }
+
+    this.inboundJournal.markDispatched(messageId, claimToken);
+    let deferred = false;
+    try {
+      const result = event && this.handler ? await this.handler(event) : undefined;
+      if (result) {
+        deferred = true;
+        // Shadow's legacy inbox retains pre-handler crash replay only. Once the
+        // downstream queue accepted a receipt, replaying this file after a
+        // mid-turn crash would duplicate an outcome the durable journal marks
+        // uncertain. Enforced never created a legacy file; removal is harmless.
+        this.legacyInboundInbox.remove(update.update_id);
+        void this.settleDeferredInbound(update, messageId, claimToken, result.completion);
+        return;
+      }
+      this.inboundJournal.complete(messageId, claimToken);
+    } catch (error) {
+      this.markInboundOutcomeUnknown(update, messageId, claimToken, error);
+    } finally {
+      if (!deferred) this.legacyInboundInbox.remove(update.update_id);
+    }
+  }
+
+  private async settleDeferredInbound(
+    update: TgUpdate,
+    messageId: string,
+    claimToken: string,
+    completion: Promise<void>,
+  ): Promise<void> {
+    try {
+      await completion;
+      this.inboundJournal.complete(messageId, claimToken);
+    } catch (error) {
+      this.markInboundOutcomeUnknown(update, messageId, claimToken, error);
+    } finally {
+      this.legacyInboundInbox.remove(update.update_id);
+    }
+  }
+
+  private markInboundOutcomeUnknown(
+    update: TgUpdate,
+    messageId: string,
+    claimToken: string,
+    error: unknown,
+  ): void {
+    try {
+      this.inboundJournal.markOutcomeUnknown(
+        messageId,
+        claimToken,
+        `handler result unknown: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    } catch (journalError) {
+      process.stderr.write(
+        `[${new Date().toISOString()}] inbound outcome-unknown persistence failed (update ${update.update_id}): ${journalError instanceof Error ? (journalError.stack ?? journalError.message) : String(journalError)}\n`,
+      );
+    }
+    process.stderr.write(
+      `[${new Date().toISOString()}] inbound dispatch outcome unknown (update ${update.update_id}): ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
+    );
+  }
+
+  /** Queue gauges used by the reliability sampler without exposing payloads. */
+  deliveryQueueDepths(): Record<string, number> {
+    const states = this.inboundJournal.summary().states;
+    return {
+      "inbound.replayable": states.received + states.claimed,
+      "inbound.uncertain": states.uncertain,
+    };
   }
 
   async whoami(): Promise<{ id: string; username?: string; displayName?: string }> {
@@ -218,10 +450,7 @@ export class TelegramTransport
     if (to.channel !== "telegram") throw new Error("TelegramTransport.sendText: wrong channel");
     let lastRef: MessageRef = { channel: "telegram", chatId: to.chatId, messageId: 0 };
     for (const chunk of chunkText(text, this.capabilities.text.maxChars)) {
-      await wireSendText({ chat_id: to.chatId, thread_id: to.threadId }, chunk);
-      // The plain sendMessage wire is best-effort (no id returned); the ref
-      // carries the chat coordinates, sufficient for the poller's current use.
-      lastRef = { channel: "telegram", chatId: to.chatId, messageId: 0 };
+      lastRef = await this.outboundSender.send({ kind: "text", to, text: chunk });
     }
     return lastRef;
   }
@@ -287,7 +516,7 @@ export class TelegramTransport
   }: {
     to: ChatAddress;
     text: string;
-    buttons: string[];
+    buttons: OutboundButton[];
   }): Promise<MessageRef> {
     if (to.channel !== "telegram") throw new Error("TelegramTransport.sendButtons: wrong channel");
     // One button per row. callback_data carries the thread + label as
@@ -295,13 +524,7 @@ export class TelegramTransport
     // tapped label back into the right topic as the user's next message
     // (same wire the retired mcp-telegram used). Bot API caps callback_data at
     // 64 bytes, so the encoded string is trimmed to fit.
-    const tid = to.threadId ?? "dm";
-    const rows = buttons.map((label) => [{
-      text: label,
-      callback_data: `ans:${tid}:${label}`.slice(0, 64),
-    }]);
-    const res = await sendInlineKeyboard(to.chatId, text, rows, to.threadId);
-    return { channel: "telegram", chatId: to.chatId, messageId: res?.message_id ?? 0 };
+    return this.outboundSender.send({ kind: "buttons", to, text, buttons });
   }
 
   // ─── ProactiveCapable ────────────────────────────────────────────────────────

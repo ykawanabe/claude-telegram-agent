@@ -17,6 +17,7 @@
  *     any ─crash─→ crashed ─enqueue─→ idle (respawn on next message)
  */
 import { ClaudeDaemon, type ClaudeDaemonOptions, type TurnEndInfo, type CrashInfo } from "./claude-daemon";
+import type { DaemonEvent, EventSink, ResourceRegistryPort } from "./contracts";
 
 export interface RegistryOptions {
   /** Default 2000ms — collapse messages arriving within this window. */
@@ -34,8 +35,12 @@ export interface RegistryOptions {
   claudeBin?: string;
   /** Per-topic daemon options — called lazily to build cwd/uuid/etc. */
   daemonOptsFor: (threadId: string) => Omit<ClaudeDaemonOptions, "claudeBin">;
-  /** Called for every assistant text block — Telegram-post side effect. */
-  onText: (threadId: string, text: string) => void;
+  /** Preferred Phase 0 registry observation boundary. Synchronous/nonthrowing;
+   *  when present it replaces the six legacy callbacks below. */
+  eventSink?: EventSink;
+  /** Legacy callback surface retained for compatible construction in tests and
+   *  downstream callers. Production wiring now uses eventSink. */
+  onText?: (threadId: string, text: string) => void;
   /** Optional: called when a batch is flushed to claude (text already sent). */
   onFlush?: (threadId: string, combinedText: string) => void;
   /** Optional: turn-start callback — fired when a flushed batch is sent to the
@@ -87,15 +92,43 @@ export interface RegistryOptions {
    *  text from the aborting turn does NOT extend it (unlike the normal
    *  watchdog), so a steer recovers promptly. Default 12s. */
   interruptEscalateMs?: number;
+  /** Hard bounds for the in-memory handoff. The queue cap is global across
+   * topics; one in-flight batch plus one pending batch may coexist. */
+  maxPendingMessages?: number;
+  maxTrackedTopics?: number;
+  maxQueuedMessageChars?: number;
+  /** Spawn retries are pre-dispatch and therefore safe, but must be finite. */
+  maxSpawnAttempts?: number;
 }
 
 type DaemonState = "idle" | "pending" | "inFlight" | "released" | "crashed";
 
+interface DispatchReceipt {
+  settled: boolean;
+  resolve(): void;
+  reject(error: unknown): void;
+}
+
+interface QueuedPrompt {
+  text: string;
+  receipt?: DispatchReceipt;
+  /** Runs only after stdin accepts this exact prompt's batch. Used for the
+   * delivered→read reaction without a separate unbounded side queue. */
+  onAccepted?: () => void;
+}
+
 interface DaemonHandle {
   daemon: ClaudeDaemon | null;
   state: DaemonState;
+  /** Rejects new admission while reset/shutdown is detaching this generation. */
+  closing: boolean;
+  /** Serializes and exposes async spawn+flush to lifecycle operations. */
+  activeFlush: Promise<void> | null;
   /** Outstanding text pieces for the next batch. */
-  queue: string[];
+  queue: QueuedPrompt[];
+  /** Receipts for the batch currently executing. They settle only on a real
+   * turn-end or a definite failure/crash, not merely on an in-memory enqueue. */
+  inFlightReceipts: DispatchReceipt[];
   /** Debounce timer (cleared if a new message arrives before fire). */
   debounceTimer: ReturnType<typeof setTimeout> | null;
   /** Exponential backoff on crash respawn. */
@@ -105,9 +138,13 @@ interface DaemonHandle {
   crashCount: number;
   /** Spawned count — exposed for tests to detect respawns. */
   spawnedCount: number;
+  /** Consecutive pre-dispatch spawn failures for the current backlog. */
+  spawnFailureCount: number;
   /** Wall-clock ms when releaseForTerminal was last called; null when not
    *  released. Drives the orphaned-handoff TTL self-heal. */
   releasedAt: number | null;
+  /** One timer per released topic, armed only when queued work exists. */
+  releaseTimer: ReturnType<typeof setTimeout> | null;
   /** Inactivity watchdog for the current inFlight turn (B2). Cleared on
    *  turn-end / crash / release / reset; reset on each text block. */
   inFlightTimer: ReturnType<typeof setTimeout> | null;
@@ -137,12 +174,66 @@ interface DaemonHandle {
   turnEndResolver: (() => void) | null;
 }
 
-export class ClaudeDaemonRegistry {
+export class ClaudeDaemonRegistry implements ResourceRegistryPort {
   private readonly opts: RegistryOptions;
   private readonly handles: Map<string, DaemonHandle> = new Map();
+  private shuttingDown = false;
+  private shutdownPromise: Promise<void> | null = null;
 
   constructor(opts: RegistryOptions) {
+    for (const [name, value] of [
+      ["maxPendingMessages", opts.maxPendingMessages ?? 1_000],
+      ["maxTrackedTopics", opts.maxTrackedTopics ?? 1_000],
+      ["maxQueuedMessageChars", opts.maxQueuedMessageChars ?? 65_536],
+      ["maxSpawnAttempts", opts.maxSpawnAttempts ?? 8],
+    ] as const) {
+      if (!Number.isSafeInteger(value) || value <= 0) {
+        throw new Error(`${name} must be a positive safe integer`);
+      }
+    }
+    const releaseMaxMs = opts.releaseMaxMs ?? 10 * 60_000;
+    if (!Number.isFinite(releaseMaxMs) || releaseMaxMs <= 0) {
+      throw new Error("releaseMaxMs must be a finite positive number");
+    }
     this.opts = opts;
+  }
+
+  /** Route one registry observation through the new sink, falling back to the
+   *  exact legacy callback for compatibility. Ordering and throw behavior are
+   *  intentionally unchanged. */
+  private emitEvent(event: DaemonEvent): void {
+    if (this.opts.eventSink) {
+      this.opts.eventSink.emit(event);
+      return;
+    }
+    switch (event.kind) {
+      case "text":
+        this.opts.onText?.(event.threadId, event.text);
+        return;
+      case "flush":
+        this.opts.onFlush?.(event.threadId, event.combinedText);
+        return;
+      case "turn-start":
+        this.opts.onTurnStart?.(event.threadId);
+        return;
+      case "turn-end":
+        this.opts.onTurnEnd?.(event.threadId, {
+          costUsd: event.costUsd,
+          sessionId: event.sessionId,
+        });
+        return;
+      case "spawn":
+      case "crash":
+        // Structured lifecycle observations have no legacy callback. They are
+        // consumed by EventSink-based reliability instrumentation only.
+        return;
+      case "spawn-failed":
+        this.opts.onSpawnFail?.(event.threadId);
+        return;
+      case "crash-loop":
+        this.opts.onCrashLoop?.(event.threadId, event.crashCount);
+        return;
+    }
   }
 
   /** Total number of live daemons (state != released/crashed). */
@@ -175,7 +266,7 @@ export class ClaudeDaemonRegistry {
   snapshotQueues(): Array<[string, string[]]> {
     const out: Array<[string, string[]]> = [];
     for (const [threadId, handle] of this.handles) {
-      out.push([threadId, [...handle.queue]]);
+      out.push([threadId, handle.queue.map((entry) => entry.text)]);
     }
     return out;
   }
@@ -185,17 +276,66 @@ export class ClaudeDaemonRegistry {
    * timer collapses rapid sends; mid-turn enqueues hold until turn-end.
    */
   enqueue(threadId: string, text: string): void {
+    this.enqueuePrompt(threadId, { text });
+  }
+
+  /** Enqueue and return a receipt which settles only when Claude reports the
+   * corresponding turn-end. The Telegram inbound journal uses this to avoid
+   * treating a volatile queue insertion as completed delivery. */
+  enqueueWithReceipt(
+    threadId: string,
+    text: string,
+    hooks: { onAccepted?: () => void } = {},
+  ): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const receipt: DispatchReceipt = {
+        settled: false,
+        resolve: () => {
+          if (receipt.settled) return;
+          receipt.settled = true;
+          resolve();
+        },
+        reject: (error) => {
+          if (receipt.settled) return;
+          receipt.settled = true;
+          reject(error);
+        },
+      };
+      this.enqueuePrompt(threadId, { text, receipt, onAccepted: hooks.onAccepted });
+    });
+  }
+
+  private enqueuePrompt(threadId: string, prompt: QueuedPrompt): void {
+    if (this.shuttingDown) throw new Error("daemon registry is shutting down and cannot accept work");
+    if (!threadId) throw new Error("daemon queue threadId must not be empty");
+    if (!prompt.text || prompt.text.length > (this.opts.maxQueuedMessageChars ?? 65_536)) {
+      throw new Error(`daemon queued message must contain 1-${this.opts.maxQueuedMessageChars ?? 65_536} characters`);
+    }
+    if (this.pendingMessageCount() >= (this.opts.maxPendingMessages ?? 1_000)) {
+      throw new Error(`daemon pending queue capacity reached (${this.opts.maxPendingMessages ?? 1_000})`);
+    }
     let handle = this.handles.get(threadId);
+    if (handle?.closing) {
+      throw new Error(`daemon topic is closing and cannot accept work: ${threadId}`);
+    }
     if (!handle) {
+      if (this.handles.size >= (this.opts.maxTrackedTopics ?? 1_000)) {
+        throw new Error(`daemon tracked-topic capacity reached (${this.opts.maxTrackedTopics ?? 1_000})`);
+      }
       handle = {
         daemon: null,
         state: "idle",
+        closing: false,
+        activeFlush: null,
         queue: [],
+        inFlightReceipts: [],
         debounceTimer: null,
         backoffMs: 0,
         crashCount: 0,
         spawnedCount: 0,
+        spawnFailureCount: 0,
         releasedAt: null,
+        releaseTimer: null,
         inFlightTimer: null,
         interruptTimer: null,
         postInterrupt: false,
@@ -205,7 +345,7 @@ export class ClaudeDaemonRegistry {
       };
       this.handles.set(threadId, handle);
     }
-    handle.queue.push(text);
+    handle.queue.push(prompt);
     // Activity stamp → keeps the idle-eviction sweep from reaping a topic the
     // user is actively messaging (the eviction clock restarts on every send).
     handle.lastActivityAt = Date.now();
@@ -220,6 +360,8 @@ export class ClaudeDaemonRegistry {
       const maxMs = this.opts.releaseMaxMs ?? 10 * 60_000;
       if (handle.releasedAt != null && Date.now() - handle.releasedAt > maxMs) {
         void this.reacquireFromTerminal(threadId);
+      } else {
+        this.armReleaseExpiry(threadId, handle);
       }
       return;
     }
@@ -237,6 +379,28 @@ export class ClaudeDaemonRegistry {
     this.armDebounce(threadId, handle);
   }
 
+  private pendingMessageCount(): number {
+    let total = 0;
+    for (const handle of this.handles.values()) total += handle.queue.length;
+    return total;
+  }
+
+  private resolveInFlightReceipts(handle: DaemonHandle): void {
+    const receipts = handle.inFlightReceipts;
+    handle.inFlightReceipts = [];
+    for (const receipt of receipts) receipt.resolve();
+  }
+
+  private rejectInFlightReceipts(handle: DaemonHandle, error: unknown): void {
+    const receipts = handle.inFlightReceipts;
+    handle.inFlightReceipts = [];
+    for (const receipt of receipts) receipt.reject(error);
+  }
+
+  private rejectQueuedReceipts(handle: DaemonHandle, error: unknown): void {
+    for (const entry of handle.queue) entry.receipt?.reject(error);
+  }
+
   /** Kill the topic's daemon for β handoff (Open in Terminal). Incoming
    *  messages queue silently until reacquireFromTerminal. */
   async releaseForTerminal(threadId: string): Promise<void> {
@@ -249,7 +413,9 @@ export class ClaudeDaemonRegistry {
     // from arming a debounce timer mid-teardown.
     handle.state = "released";
     handle.releasedAt = Date.now();
+    if (handle.releaseTimer) { clearTimeout(handle.releaseTimer); handle.releaseTimer = null; }
     handle.postInterrupt = false;
+    this.rejectInFlightReceipts(handle, new Error(`daemon turn released before completion: ${threadId}`));
     if (handle.debounceTimer) {
       clearTimeout(handle.debounceTimer);
       handle.debounceTimer = null;
@@ -262,6 +428,7 @@ export class ClaudeDaemonRegistry {
       clearTimeout(handle.interruptTimer);
       handle.interruptTimer = null;
     }
+    const activeFlush = handle.activeFlush;
     if (handle.daemon) {
       // SIGTERM gives claude a chance to close the session lock file
       // cleanly — necessary so the user's TUI `claude --resume` doesn't
@@ -269,6 +436,19 @@ export class ClaudeDaemonRegistry {
       await handle.daemon.stop("SIGTERM");
       handle.daemon = null;
     }
+    // A flush may have been awaiting process startup when release began. Its
+    // lifecycle guard stops that just-spawned daemon without sending. Await it
+    // before acknowledging the terminal handoff so no session lock is orphaned.
+    if (activeFlush) await activeFlush;
+    if (this.handles.get(threadId) !== handle) return;
+    if (handle.daemon) {
+      await handle.daemon.stop("SIGTERM");
+      handle.daemon = null;
+    }
+    // send() failure during teardown may have transiently set crashed. The
+    // handoff acknowledgement is authoritative: keep this generation released.
+    handle.state = "released";
+    if (handle.queue.length > 0) this.armReleaseExpiry(threadId, handle);
   }
 
   /** Respawn the daemon after the user closes their terminal. Flushes
@@ -278,6 +458,7 @@ export class ClaudeDaemonRegistry {
     if (!handle) return;
     handle.state = "idle";
     handle.releasedAt = null;
+    if (handle.releaseTimer) { clearTimeout(handle.releaseTimer); handle.releaseTimer = null; }
     // If there's queued work, arm the debounce now. Otherwise the
     // daemon stays unspawned until the next enqueue (lazy).
     if (handle.queue.length > 0) {
@@ -301,6 +482,10 @@ export class ClaudeDaemonRegistry {
   async resetTopic(threadId: string): Promise<void> {
     const handle = this.handles.get(threadId);
     if (!handle) return;
+    handle.closing = true;
+    const resetError = new Error(`daemon topic reset before dispatch completion: ${threadId}`);
+    this.rejectQueuedReceipts(handle, resetError);
+    this.rejectInFlightReceipts(handle, resetError);
     if (handle.debounceTimer) {
       clearTimeout(handle.debounceTimer);
       handle.debounceTimer = null;
@@ -313,10 +498,16 @@ export class ClaudeDaemonRegistry {
       clearTimeout(handle.interruptTimer);
       handle.interruptTimer = null;
     }
-    if (handle.daemon) {
-      await handle.daemon.stop("SIGTERM");
-    }
-    this.handles.delete(threadId);
+    if (handle.releaseTimer) { clearTimeout(handle.releaseTimer); handle.releaseTimer = null; }
+    const activeFlush = handle.activeFlush;
+    if (handle.daemon) await handle.daemon.stop("SIGTERM");
+    if (activeFlush) await activeFlush;
+    // Re-run rejection after awaits: work already captured by an overlapping
+    // flush must not survive reset, and admission was blocked by `closing`.
+    this.rejectQueuedReceipts(handle, resetError);
+    this.rejectInFlightReceipts(handle, resetError);
+    if (handle.daemon) await handle.daemon.stop("SIGTERM");
+    if (this.handles.get(threadId) === handle) this.handles.delete(threadId);
   }
 
   /** Abort the in-flight turn for a topic WITHOUT discarding the session or
@@ -373,6 +564,7 @@ export class ClaudeDaemonRegistry {
 
     // Fallback: SIGTERM + lazy respawn (the pre-graceful behavior). Only here
     // do we clear the watchdog — the SIGTERM-driven close guarantees recovery.
+    this.rejectInFlightReceipts(handle, new Error(`daemon turn stopped before completion: ${threadId}`));
     this.clearInFlightTimer(handle);
     handle.postInterrupt = false;
     handle.stopping = true;
@@ -389,9 +581,20 @@ export class ClaudeDaemonRegistry {
   }
 
   /** Tear down all daemons. Called on poller graceful exit. */
-  async shutdown(): Promise<void> {
+  shutdown(): Promise<void> {
+    if (this.shutdownPromise) return this.shutdownPromise;
+    this.shuttingDown = true;
+    this.shutdownPromise = this.shutdownInternal();
+    return this.shutdownPromise;
+  }
+
+  private async shutdownInternal(): Promise<void> {
     const promises: Promise<void>[] = [];
-    for (const handle of this.handles.values()) {
+    for (const [threadId, handle] of this.handles) {
+      handle.closing = true;
+      const shutdownError = new Error(`daemon registry shut down before dispatch completion: ${threadId}`);
+      this.rejectQueuedReceipts(handle, shutdownError);
+      this.rejectInFlightReceipts(handle, shutdownError);
       if (handle.debounceTimer) {
         clearTimeout(handle.debounceTimer);
         handle.debounceTimer = null;
@@ -404,11 +607,19 @@ export class ClaudeDaemonRegistry {
         clearTimeout(handle.interruptTimer);
         handle.interruptTimer = null;
       }
+      if (handle.releaseTimer) { clearTimeout(handle.releaseTimer); handle.releaseTimer = null; }
       if (handle.daemon) {
         promises.push(handle.daemon.stop("SIGTERM"));
       }
+      if (handle.activeFlush) promises.push(handle.activeFlush);
     }
-    await Promise.all(promises);
+    await Promise.allSettled(promises);
+    for (const [threadId, handle] of this.handles) {
+      const shutdownError = new Error(`daemon registry shut down before dispatch completion: ${threadId}`);
+      this.rejectQueuedReceipts(handle, shutdownError);
+      this.rejectInFlightReceipts(handle, shutdownError);
+      if (handle.daemon) await handle.daemon.stop("SIGTERM");
+    }
     this.handles.clear();
   }
 
@@ -432,6 +643,29 @@ export class ClaudeDaemonRegistry {
       out.push(threadId);
     }
     return out;
+  }
+
+  /** Return the oldest quiescent daemons that may be evicted to bring the
+   *  warm-daemon count down to maxWarm. This is deliberately PURE: the poller
+   *  performs the resets and logs them. Busy, queued, released, and crashed
+   *  topics are never candidates, so capacity pressure cannot interrupt work.
+   *  maxWarm <= 0 disables the cap. */
+  overCapacityIdleCandidates(maxWarm: number): string[] {
+    if (maxWarm <= 0) return [];
+
+    let liveCount = 0;
+    const idle: Array<{ threadId: string; lastActivityAt: number }> = [];
+    for (const [threadId, h] of this.handles) {
+      if (!h.daemon || !h.daemon.isAlive) continue;
+      liveCount += 1;
+      if (h.state !== "idle" || h.queue.length > 0) continue;
+      idle.push({ threadId, lastActivityAt: h.lastActivityAt });
+    }
+
+    const overflow = liveCount - Math.floor(maxWarm);
+    if (overflow <= 0) return [];
+    idle.sort((a, b) => a.lastActivityAt - b.lastActivityAt);
+    return idle.slice(0, overflow).map(({ threadId }) => threadId);
   }
 
   /** True iff the topic is currently idle with an empty queue — the "still safe
@@ -507,6 +741,23 @@ export class ClaudeDaemonRegistry {
     }, this.opts.debounceMs ?? 2000);
   }
 
+  private armReleaseExpiry(threadId: string, handle: DaemonHandle): void {
+    if (handle.releaseTimer) clearTimeout(handle.releaseTimer);
+    const maxMs = this.opts.releaseMaxMs ?? 10 * 60_000;
+    const elapsed = handle.releasedAt == null ? 0 : Date.now() - handle.releasedAt;
+    handle.releaseTimer = setTimeout(() => {
+      handle.releaseTimer = null;
+      const current = this.handles.get(threadId);
+      if (
+        current !== handle
+        || current.closing
+        || current.state !== "released"
+        || current.queue.length === 0
+      ) return;
+      void this.reacquireFromTerminal(threadId);
+    }, Math.max(0, maxMs - elapsed));
+  }
+
   /** Mid-turn auto-steer: after interruptDebounceMs of quiet, interrupt the
    *  running turn so the queued messages flush into the next turn (turn-end
    *  re-arms the debounce). Resetting on each call collapses bursts. */
@@ -573,56 +824,123 @@ export class ClaudeDaemonRegistry {
     }, timeoutMs);
   }
 
-  private async flush(threadId: string): Promise<void> {
+  private flush(threadId: string): Promise<void> {
     const handle = this.handles.get(threadId);
-    if (!handle || handle.queue.length === 0) return;
+    if (!handle) return Promise.resolve();
     handle.debounceTimer = null;
+    if (
+      handle.closing
+      || handle.queue.length === 0
+      || handle.state === "inFlight"
+      || handle.state === "released"
+    ) return handle.activeFlush ?? Promise.resolve();
+    if (handle.activeFlush) return handle.activeFlush;
 
+    const active = this.flushHandle(threadId, handle).finally(() => {
+      if (handle.activeFlush === active) handle.activeFlush = null;
+    });
+    handle.activeFlush = active;
+    return active;
+  }
+
+  private async flushHandle(threadId: string, handle: DaemonHandle): Promise<void> {
     // Spawn the daemon if not running.
     if (!handle.daemon || !handle.daemon.isAlive) {
       const ok = await this.spawn(threadId, handle);
+      // release/reset/shutdown may have won while start() was awaiting. Never
+      // send through a daemon belonging to an obsolete lifecycle generation.
+      if (
+        this.handles.get(threadId) !== handle
+        || handle.closing
+        || handle.state === "released"
+      ) {
+        if (handle.daemon) {
+          const obsolete = handle.daemon;
+          await obsolete.stop("SIGTERM");
+          if (handle.daemon === obsolete) handle.daemon = null;
+        }
+        return;
+      }
       if (!ok) {
         handle.state = "crashed";
+        handle.spawnFailureCount += 1;
         // Surface the spawn failure — otherwise the user's message sits queued
         // in silence (typing times out, no error ever reaches the chat).
-        this.opts.onSpawnFail?.(threadId);
+        this.emitEvent({ kind: "spawn-failed", threadId });
+        if (handle.spawnFailureCount >= (this.opts.maxSpawnAttempts ?? 8)) {
+          const dropped = handle.queue;
+          handle.queue = [];
+          const error = new Error(
+            `daemon spawn failed ${handle.spawnFailureCount} times before dispatch: ${threadId}`,
+          );
+          for (const entry of dropped) entry.receipt?.reject(error);
+          handle.state = "idle";
+          return;
+        }
+        const max = this.opts.maxBackoffMs ?? 60_000;
+        handle.backoffMs = handle.backoffMs === 0 ? Math.min(500, max) : Math.min(handle.backoffMs * 2, max);
+        setTimeout(() => {
+          const current = this.handles.get(threadId);
+          if (
+            !current
+            || current !== handle
+            || current.closing
+            || current.state !== "crashed"
+            || current.queue.length === 0
+          ) return;
+          current.state = "idle";
+          this.armDebounce(threadId, current);
+        }, handle.backoffMs);
         return;
       }
     }
+
+    if (handle.queue.length === 0 || handle.closing || handle.state === "released") return;
 
     // Combine queued text into one user event. Single newline between
     // entries reads naturally for "I'm sending a few thoughts" patterns;
     // multi-paragraph claude prompts use blank line. Single newline is
     // the safer default.
-    const combined = handle.queue.join("\n");
+    const batch = handle.queue;
+    const combined = batch.map((entry) => entry.text).join("\n");
     handle.queue = [];
+    handle.inFlightReceipts = batch.flatMap((entry) => entry.receipt ? [entry.receipt] : []);
     handle.state = "inFlight";
 
     try {
-      this.opts.onFlush?.(threadId, combined);
+      this.emitEvent({ kind: "flush", threadId, combinedText: combined });
       await handle.daemon!.send(combined);
+      for (const entry of batch) {
+        try { entry.onAccepted?.(); } catch { /* lifecycle hooks are best-effort */ }
+      }
       // Turn is now in-flight — signal turn-start so the poller can (re-)assert
       // the typing indicator. Fires on EVERY turn, so a steered continuation
       // after a mid-turn interrupt re-arms typing (the interrupted turn-end
       // cleared the marker).
-      this.opts.onTurnStart?.(threadId);
+      this.emitEvent({ kind: "turn-start", threadId });
       // Start the inactivity watchdog: if the daemon emits no text and no
       // turn-end/crash before it fires, the turn is presumed wedged.
       this.armInFlightWatchdog(threadId, handle);
     } catch (err) {
-      // Daemon went away between the alive-check and the write. Re-queue
-      // the message so the user doesn't lose it, then rearm the debounce
-      // so the respawn path actually fires — without rearm, the message
-      // sits in the queue forever if no follow-up enqueue ever happens.
+      // A tracked inbound write failure has an unknown outcome and must not be
+      // retried automatically. Legacy/untracked prompts keep the old requeue
+      // behavior because no journal receipt exists to reconcile them.
+      this.rejectInFlightReceipts(handle, err);
+      if (
+        this.handles.get(threadId) !== handle
+        || handle.closing
+        || handle.state === "released"
+      ) return;
       handle.state = "crashed";
-      handle.queue.unshift(combined);
+      const retryableLegacy = batch.filter((entry) => !entry.receipt);
+      handle.queue.unshift(...retryableLegacy);
       // Defer the rearm so the on('crash') handler (which may fire in the
       // same tick) finishes setting state first. The crash handler will
       // transition crashed→idle after backoff and arm-debounce; if a write
       // error fires before crash, we self-recover via the next tick.
       setTimeout(() => {
         const h = this.handles.get(threadId);
-        if (!h) return;
+        if (!h || h !== handle || h.closing) return;
         // Only rearm if state is still crashed (avoid double-arming if the
         // crash handler already armed during its backoff timer).
         if (h.state === "crashed" && h.queue.length > 0) {
@@ -636,11 +954,16 @@ export class ClaudeDaemonRegistry {
   /** Create a fresh ClaudeDaemon, wire its events to registry callbacks,
    *  start it, and stash in the handle. Returns true on success. */
   private async spawn(threadId: string, handle: DaemonHandle): Promise<boolean> {
-    const daemonOpts = this.opts.daemonOptsFor(threadId);
-    const daemon = new ClaudeDaemon({
-      ...daemonOpts,
-      claudeBin: this.opts.claudeBin,
-    });
+    let daemon: ClaudeDaemon;
+    try {
+      const daemonOpts = this.opts.daemonOptsFor(threadId);
+      daemon = new ClaudeDaemon({
+        ...daemonOpts,
+        claudeBin: this.opts.claudeBin,
+      });
+    } catch {
+      return false;
+    }
 
     daemon.on("text", (text: string) => {
       // Activity → reset the inactivity watchdog so a long-but-active turn is
@@ -649,15 +972,22 @@ export class ClaudeDaemonRegistry {
       // escalation deadline back — we asked the turn to stop, so a steer should
       // recover promptly even if claude keeps dribbling out the old answer.
       const h = this.handles.get(threadId);
-      if (h && h.state === "inFlight" && !h.postInterrupt) this.armInFlightWatchdog(threadId, h);
-      this.opts.onText(threadId, text);
+      if (!h || h !== handle || h.daemon !== daemon) return;
+      if (h.state === "inFlight" && !h.postInterrupt) this.armInFlightWatchdog(threadId, h);
+      this.emitEvent({ kind: "text", threadId, text });
     });
 
     daemon.on("turn-end", (info: TurnEndInfo) => {
-      this.opts.onTurnEnd?.(threadId, info);
       const h = this.handles.get(threadId);
-      if (!h) return;
+      if (!h || h !== handle || h.daemon !== daemon) return;
+      this.emitEvent({
+        kind: "turn-end",
+        threadId,
+        costUsd: info.costUsd,
+        sessionId: info.sessionId,
+      });
       this.clearInFlightTimer(h);
+      this.resolveInFlightReceipts(h);
       h.postInterrupt = false; // turn ended → drop the escalation mode
       if (h.state === "released") return; // user yanked the daemon mid-turn
       // Healthy turn — reset crash backoff + the consecutive-crash counter.
@@ -680,8 +1010,12 @@ export class ClaudeDaemonRegistry {
 
     daemon.on("crash", (info: CrashInfo) => {
       const h = this.handles.get(threadId);
-      if (!h) return;
+      if (!h || h !== handle || h.daemon !== daemon) return;
       this.clearInFlightTimer(h);
+      this.rejectInFlightReceipts(
+        h,
+        new Error(`daemon crashed before turn completion: ${threadId} (code=${info.code}, signal=${info.signal})`),
+      );
       h.postInterrupt = false;
       if (h.interruptTimer) { clearTimeout(h.interruptTimer); h.interruptTimer = null; }
       // Drop any runTurnAndWait resolver: the turn it awaited died with the
@@ -689,6 +1023,7 @@ export class ClaudeDaemonRegistry {
       // stale resolver → a spurious idle-clear right after the user's reply.
       // runTurnAndWait's own timeout still resolves it as "timeout".
       h.turnEndResolver = null;
+      if (h.closing) { h.daemon = null; return; }
       // Clean exit during release-for-terminal is expected; don't treat as crash.
       if (h.state === "released") return;
       // Intentional /stop teardown: stopTurn() owns the post-stop transition
@@ -700,36 +1035,49 @@ export class ClaudeDaemonRegistry {
       // crash-loop notice exactly once when we cross the threshold (claude spawns
       // fine but dies every turn — bad /model, corrupt session JSONL, auth error).
       h.crashCount += 1;
+      this.emitEvent({
+        kind: "crash",
+        threadId,
+        crashCount: h.crashCount,
+        code: info.code,
+        signal: info.signal,
+      });
       const crashThreshold = this.opts.crashLoopThreshold ?? 3;
-      if (h.crashCount === crashThreshold) this.opts.onCrashLoop?.(threadId, h.crashCount);
+      if (h.crashCount === crashThreshold) {
+        this.emitEvent({ kind: "crash-loop", threadId, crashCount: h.crashCount });
+      }
       // Schedule a respawn attempt with exponential backoff. If the queue
       // is non-empty, the respawn will flush; otherwise stays idle until
       // the next enqueue.
       const max = this.opts.maxBackoffMs ?? 60_000;
       h.backoffMs = h.backoffMs === 0 ? 500 : Math.min(h.backoffMs * 2, max);
       setTimeout(() => {
-        const handle = this.handles.get(threadId);
-        if (!handle) return;
-        if (handle.state !== "crashed") return; // user did something in the meantime
+        const current = this.handles.get(threadId);
+        if (!current || current !== handle || current.closing) return;
+        if (current.state !== "crashed") return; // user did something in the meantime
         // Eager respawn if there's work to do; otherwise stay crashed and
         // let the next enqueue trigger spawn.
-        if (handle.queue.length > 0) {
-          handle.state = "idle";
-          this.armDebounce(threadId, handle);
+        if (current.queue.length > 0) {
+          current.state = "idle";
+          this.armDebounce(threadId, current);
         } else {
-          handle.state = "idle";
+          current.state = "idle";
         }
       }, h.backoffMs);
     });
 
     try {
       await daemon.start();
+      if (!daemon.isAlive) return false;
     } catch {
       return false;
     }
     handle.daemon = daemon;
     handle.spawnedCount += 1;
-    handle.state = "idle";
+    handle.spawnFailureCount = 0;
+    handle.backoffMs = 0;
+    if (!handle.closing && handle.state !== "released") handle.state = "idle";
+    this.emitEvent({ kind: "spawn", threadId, spawnedCount: handle.spawnedCount });
     return true;
   }
 }

@@ -12,6 +12,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { ClaudeDaemonRegistry } from "./claude-daemon-registry";
+import type { DaemonEvent } from "./contracts";
 
 const FIXTURE = join(import.meta.dir, "fixtures/fake-claude-daemon.sh");
 
@@ -33,6 +34,32 @@ describe("ClaudeDaemonRegistry basic dispatch", () => {
 
     expect(texts[0]).toBe("You said: hello");
     expect(reg.daemonCount).toBe(1);
+  });
+
+  test("EventSink replaces the legacy callback surface without changing order", async () => {
+    const events: DaemonEvent[] = [];
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 50,
+      daemonOptsFor: () => ({ cwd: "/tmp" }),
+      eventSink: { emit: (event) => events.push(event) },
+    });
+
+    reg.enqueue("topic-42", "hello");
+    await waitFor(() => events.some((event) => event.kind === "turn-end"), 5000);
+
+    expect(events.map((event) => event.kind)).toEqual([
+      "spawn",
+      "flush",
+      "turn-start",
+      "text",
+      "turn-end",
+    ]);
+    expect(events.find((event) => event.kind === "text")).toEqual({
+      kind: "text",
+      threadId: "topic-42",
+      text: "You said: hello",
+    });
   });
 
   test("subsequent messages reuse the warm daemon (no respawn)", async () => {
@@ -94,6 +121,116 @@ describe("ClaudeDaemonRegistry basic dispatch", () => {
     await waitFor(() => starts.length >= 2, 5000);
 
     expect(starts).toEqual(["topic-42", "topic-42"]);
+  });
+
+  test("durable receipt stays pending until the daemon reports turn-end", async () => {
+    const flushes: string[] = [];
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 10,
+      daemonOptsFor: () => ({ cwd: "/tmp", env: { FAKE_CLAUDE_MODE: "slow" } }),
+      onFlush: (_thread, text) => flushes.push(text),
+    });
+
+    let settled = false;
+    const completion = reg.enqueueWithReceipt("topic-42", "durable").then(() => { settled = true; });
+    await waitFor(() => flushes.length === 1, 5000);
+    expect(settled).toBe(false);
+    await completion;
+    expect(settled).toBe(true);
+  });
+
+  test("durable receipt rejects when the daemon crashes before turn-end", async () => {
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 10,
+      daemonOptsFor: () => ({ cwd: "/tmp", env: { FAKE_CLAUDE_MODE: "crash-always" } }),
+    });
+
+    await expect(reg.enqueueWithReceipt("topic-42", "unknown outcome")).rejects.toThrow(
+      "daemon crashed before turn completion",
+    );
+  });
+
+  test("queue, topic, payload, and spawn attempts have hard finite caps", async () => {
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: "/definitely/missing/claude",
+      debounceMs: 1,
+      maxBackoffMs: 5,
+      maxPendingMessages: 2,
+      maxTrackedTopics: 1,
+      maxQueuedMessageChars: 8,
+      maxSpawnAttempts: 2,
+      daemonOptsFor: () => ({ cwd: "/tmp" }),
+    });
+
+    const first = reg.enqueueWithReceipt("topic-42", "one");
+    const second = reg.enqueueWithReceipt("topic-42", "two");
+    // Attach rejection observers immediately so the deliberately tiny retry
+    // schedule cannot surface an unhandled rejection before the assertions.
+    void first.catch(() => {});
+    void second.catch(() => {});
+    expect(() => reg!.enqueue("topic-42", "three")).toThrow("pending queue capacity");
+    expect(() => reg!.enqueue("topic-99", "x")).toThrow("pending queue capacity");
+    expect(() => reg!.enqueue("topic-42", "too-long!" )).toThrow("1-8 characters");
+    await expect(first).rejects.toThrow("spawn failed 2 times");
+    await expect(second).rejects.toThrow("spawn failed 2 times");
+
+    await reg.shutdown();
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 5_000,
+      maxTrackedTopics: 1,
+      daemonOptsFor: () => ({ cwd: "/tmp" }),
+    });
+    reg.enqueue("topic-42", "one");
+    expect(() => reg!.enqueue("topic-99", "two")).toThrow("tracked-topic capacity");
+  });
+
+  test("stdin acceptance hook belongs to the exact prompt and never fires on spawn failure", async () => {
+    let accepted = 0;
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: "/definitely/missing/claude",
+      debounceMs: 1,
+      maxBackoffMs: 5,
+      maxSpawnAttempts: 1,
+      daemonOptsFor: () => ({ cwd: "/tmp" }),
+    });
+    const completion = reg.enqueueWithReceipt("topic-42", "no write", {
+      onAccepted: () => { accepted += 1; },
+    });
+    await expect(completion).rejects.toThrow("spawn failed 1 times");
+    expect(accepted).toBe(0);
+  });
+
+  test("daemon option construction failures follow the same finite retry path", async () => {
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 1,
+      maxBackoffMs: 5,
+      maxSpawnAttempts: 2,
+      daemonOptsFor: () => { throw new Error("mount disappeared"); },
+    });
+    await expect(reg.enqueueWithReceipt("topic-42", "bounded failure")).rejects.toThrow(
+      "spawn failed 2 times",
+    );
+  });
+
+  test("shutdown is terminal and rejects admission while an active spawn drains", async () => {
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 0,
+      daemonOptsFor: () => ({ cwd: "/tmp" }),
+    });
+    const original = reg.enqueueWithReceipt("topic-42", "during spawn");
+    void original.catch(() => {});
+    await Bun.sleep(2);
+    const shuttingDown = reg.shutdown();
+    const late = reg.enqueueWithReceipt("topic-99", "too late");
+    await expect(late).rejects.toThrow("shutting down");
+    await shuttingDown;
+    await expect(original).rejects.toThrow("shut down before dispatch completion");
+    expect(reg.daemonCount).toBe(0);
   });
 });
 
@@ -193,6 +330,47 @@ describe("ClaudeDaemonRegistry terminal handoff (β)", () => {
     await waitFor(() => sentToDaemon.length >= 2, 5000);
     expect(sentToDaemon[1]).toContain("while terminal open");
   });
+
+  test("release racing startup sends nothing, preserves the receipt, and acknowledges no live daemon", async () => {
+    const sent: string[] = [];
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 0,
+      releaseMaxMs: 5_000,
+      daemonOptsFor: () => ({ cwd: "/tmp" }),
+      onFlush: (_thread, text) => sent.push(text),
+    });
+    let settled = false;
+    const completion = reg.enqueueWithReceipt("topic-42", "race startup").then(() => { settled = true; });
+    await Bun.sleep(2);
+    await reg.releaseForTerminal("topic-42");
+    expect(reg.getStatus("topic-42")).toBe("released");
+    expect(reg.daemonCount).toBe(0);
+    expect(sent).toEqual([]);
+    expect(settled).toBe(false);
+
+    await reg.reacquireFromTerminal("topic-42");
+    await completion;
+    expect(sent).toEqual(["race startup"]);
+  });
+
+  test("release of an in-flight turn rejects its receipt and remains released", async () => {
+    const sent: string[] = [];
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 5,
+      releaseMaxMs: 5_000,
+      daemonOptsFor: () => ({ cwd: "/tmp", env: { FAKE_CLAUDE_MODE: "slow" } }),
+      onFlush: (_thread, text) => sent.push(text),
+    });
+    const completion = reg.enqueueWithReceipt("topic-42", "in flight");
+    void completion.catch(() => {});
+    await waitFor(() => sent.length === 1, 5000);
+    await reg.releaseForTerminal("topic-42");
+    await expect(completion).rejects.toThrow("released before completion");
+    expect(reg.getStatus("topic-42")).toBe("released");
+    expect(reg.daemonCount).toBe(0);
+  });
 });
 
 describe("ClaudeDaemonRegistry resetTopic (/clear semantics)", () => {
@@ -244,6 +422,26 @@ describe("ClaudeDaemonRegistry resetTopic (/clear semantics)", () => {
     });
     await reg.resetTopic("never-existed");
     expect(reg.getStatus("never-existed")).toBe("absent");
+  });
+
+  test("enqueue during reset rejects promptly and a fresh generation resolves", async () => {
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 5,
+      daemonOptsFor: () => ({ cwd: "/tmp", env: { FAKE_CLAUDE_MODE: "slow" } }),
+    });
+    const old = reg.enqueueWithReceipt("topic-42", "old generation");
+    void old.catch(() => {});
+    await waitFor(() => reg!.getStatus("topic-42") === "inFlight", 5000);
+    const resetting = reg.resetTopic("topic-42");
+    const duringReset = reg.enqueueWithReceipt("topic-42", "must reject");
+    await expect(duringReset).rejects.toThrow("closing");
+    await resetting;
+    await expect(old).rejects.toThrow("reset before dispatch completion");
+
+    const fresh = reg.enqueueWithReceipt("topic-42", "fresh generation");
+    await fresh;
+    expect(reg.getStatus("topic-42")).toBe("idle");
   });
 });
 
@@ -315,7 +513,7 @@ describe("ClaudeDaemonRegistry self-heal (incident 2026-05-21)", () => {
   let reg: ClaudeDaemonRegistry | null = null;
   afterEach(async () => { if (reg) { await reg.shutdown(); reg = null; } });
 
-  test("orphaned 'released' topic self-heals on enqueue after releaseMaxMs (terminal died, never reacquired)", async () => {
+  test("a lone queued prompt auto-reacquires after releaseMaxMs", async () => {
     const sentToDaemon: string[] = [];
     reg = new ClaudeDaemonRegistry({
       claudeBin: FIXTURE,
@@ -336,19 +534,21 @@ describe("ClaudeDaemonRegistry self-heal (incident 2026-05-21)", () => {
 
     // A message arriving BEFORE the TTL stays queued and does NOT fire — the
     // terminal might be legitimately in use; we don't yank the daemon back.
-    reg.enqueue("topic-42", "early");
+    let earlySettled = false;
+    const early = reg.enqueueWithReceipt("topic-42", "early").then(() => { earlySettled = true; });
     await new Promise((r) => setTimeout(r, 100));
     expect(sentToDaemon.length).toBe(1);
     expect(reg.getStatus("topic-42")).toBe("released");
+    expect(earlySettled).toBe(false);
 
-    // Past the TTL the orphan is assumed abandoned: the next message
-    // self-heals (auto-reacquire) and flushes the backlog instead of
-    // swallowing it forever.
-    await new Promise((r) => setTimeout(r, 200));
+    // Past the TTL the orphan is assumed abandoned even without another
+    // inbound event: the lone queued receipt must not remain dispatched forever.
+    await early;
+    expect(sentToDaemon[1]).toBe("early");
+
     reg.enqueue("topic-42", "after ttl");
-    await waitFor(() => sentToDaemon.length >= 2, 5000);
-    expect(sentToDaemon[1]).toContain("early");
-    expect(sentToDaemon[1]).toContain("after ttl");
+    await waitFor(() => sentToDaemon.length >= 3, 5000);
+    expect(sentToDaemon[2]).toBe("after ttl");
   });
 
   test("inFlight turn that goes silent (no turn-end, no crash) self-heals via inactivity watchdog", async () => {
@@ -450,6 +650,52 @@ describe("ClaudeDaemonRegistry idleCandidates", () => {
     expect(reg.getStatus("topic-42")).toBe("inFlight");
     // Even with a 0ms threshold, an inFlight turn is off-limits.
     expect(reg.idleCandidates(1)).toEqual([]);
+  });
+});
+
+describe("ClaudeDaemonRegistry overCapacityIdleCandidates", () => {
+  let reg: ClaudeDaemonRegistry | null = null;
+  afterEach(async () => { if (reg) { await reg.shutdown(); reg = null; } });
+
+  async function spawnIdle(r: ClaudeDaemonRegistry, thread: string): Promise<void> {
+    r.enqueue(thread, "hello");
+    await waitFor(() => r.getStatus(thread) === "idle", 5000);
+  }
+
+  test("returns the oldest idle daemon needed to satisfy the cap", async () => {
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 20,
+      daemonOptsFor: () => ({ cwd: "/tmp" }),
+      onText: () => {},
+    });
+    await spawnIdle(reg, "oldest");
+    await new Promise((r) => setTimeout(r, 10));
+    await spawnIdle(reg, "middle");
+    await new Promise((r) => setTimeout(r, 10));
+    await spawnIdle(reg, "newest");
+
+    expect(reg.daemonCount).toBe(3);
+    expect(reg.overCapacityIdleCandidates(2)).toEqual(["oldest"]);
+    expect(reg.overCapacityIdleCandidates(1)).toEqual(["oldest", "middle"]);
+  });
+
+  test("never returns busy work and maxWarm <= 0 disables the cap", async () => {
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 20,
+      daemonOptsFor: (thread) => ({
+        cwd: "/tmp",
+        env: thread === "busy" ? { FAKE_CLAUDE_MODE: "hang-no-result" } : undefined,
+      }),
+      onText: () => {},
+    });
+    await spawnIdle(reg, "idle");
+    reg.enqueue("busy", "work");
+    await waitFor(() => reg!.getStatus("busy") === "inFlight", 5000);
+
+    expect(reg.overCapacityIdleCandidates(1)).toEqual(["idle"]);
+    expect(reg.overCapacityIdleCandidates(0)).toEqual([]);
   });
 });
 

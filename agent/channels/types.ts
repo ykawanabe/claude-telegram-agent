@@ -138,9 +138,67 @@ export type InboundEvent<Raw = unknown> =
   | { kind: "topic-renamed"; routingKey: RoutingKey; name: string; raw: Raw }
   | { kind: "joined"; address: ChatAddress; invitedBy?: SenderId; chatTitle?: string; needsAdminForText?: boolean; raw: Raw }
   | { kind: "removed"; address: ChatAddress; raw: Raw }
+  // Successful inbound read (including an empty long-poll). The poller uses
+  // this to heartbeat actual transport progress instead of a blind timer.
+  | { kind: "transport-progress" }
   // reconnecting; informational. Fatal errors → adapter throws from start()/run
   // loop → process.exit → launchd respawn.
   | { kind: "transport-degraded"; reason: string };
+
+// ─── delivery boundaries ────────────────────────────────────────────────────
+
+/**
+ * Durable hand-off used by pull transports before they advance a remote
+ * cursor. `persist` is synchronous and must either make the entry recoverable
+ * or throw. `listPending` returns recovery order; `remove` is idempotent and
+ * best-effort after dispatch.
+ *
+ * This deliberately does not promise exactly-once delivery. A crash may replay
+ * an entry whose side effects completed before `remove`.
+ */
+export interface InboundJournal<Entry, Id = string> {
+  persist(entry: Entry): void;
+  listPending(): Entry[];
+  remove(id: Id): void;
+}
+
+/** User-visible chat output. Reactions, typing and command registration remain
+ * transport capabilities rather than queued messages. */
+export type OutboundButton = string | { label: string; action: string };
+
+export type OutboundMessage =
+  | { kind: "text"; to: ChatAddress; text: string; deliveryKey?: string }
+  | { kind: "buttons"; to: ChatAddress; text: string; buttons: OutboundButton[]; deliveryKey?: string };
+
+/**
+ * Ordering seam for user-visible chat output. The Phase 0 implementation is an
+ * immediate pass-through: resolution means the transport's send attempt has
+ * finished. It does NOT yet promise persistence, retry, deduplication,
+ * backpressure or confirmed platform delivery.
+ */
+export interface OutboundQueue {
+  enqueue(message: OutboundMessage): Promise<void>;
+  enqueueTracked(message: OutboundMessage): Promise<OutboundQueueResult>;
+  /** Durable records which are not yet in a confirmed terminal state. */
+  depth(): number;
+  /** Stop retry polling and wait for an in-flight drain. */
+  stop(): Promise<void>;
+}
+
+export interface OutboundQueueResult {
+  status: "queued" | "delivered" | "retry_scheduled" | "dead_letter" | "uncertain";
+  messageRef?: MessageRef;
+}
+
+/** A handler may defer its durable acknowledgement until downstream work has
+ * actually finished. The transport keeps the inbound journal at dispatched
+ * until completion settles, so a process death cannot silently turn an
+ * in-memory handoff into completed delivery. */
+export interface DeferredInboundCompletion {
+  completion: Promise<void>;
+}
+
+export type InboundHandlerResult = void | DeferredInboundCompletion;
 
 // ─── core interface (required) ───────────────────────────────────────────────
 
@@ -157,10 +215,10 @@ export interface ChatTransport {
   stop(): Promise<void>; // graceful, <5s (SIGTERM budget)
 
   /** Subscribe to normalized inbound events. Adapter owns reconnect; emits
-   *  `transport-degraded` while retrying. The adapter MUST persist its read
-   *  cursor BEFORE invoking the handler (Telegram offset-before-dispatch
-   *  durability contract) so a crash drops rather than double-delivers. */
-  onEvent(handler: (e: InboundEvent) => Promise<void>): void;
+   *  `transport-degraded` while retrying and `transport-progress` after a
+   *  successful read. Before advancing its remote cursor, the adapter MUST
+   *  durably persist inbound work so a crash cannot silently drop it. */
+  onEvent(handler: (e: InboundEvent) => Promise<InboundHandlerResult>): void;
 
   whoami(): Promise<{ id: string; username?: string; displayName?: string }>;
 
@@ -220,7 +278,7 @@ export interface ButtonCapable {
   /** Inline-keyboard choice buttons. On Telegram this is the MCP send_telegram
    *  path (separate process); on Slack/Discord native components; on LINE a
    *  Quick Reply. Each tap returns a `button-press` InboundEvent. */
-  sendButtons(args: { to: ChatAddress; text: string; buttons: string[] }): Promise<MessageRef>;
+  sendButtons(args: { to: ChatAddress; text: string; buttons: OutboundButton[] }): Promise<MessageRef>;
 }
 
 export interface ProactiveCapable {

@@ -189,10 +189,11 @@ private struct PagerTab: View {
     @AppStorage("caffeinateOnlyOnAC") private var caffeinateOnlyOnAC = true
 
     // Idle-daemon eviction is agent state (settings.json via cta), not a Mac
-    // app pref — so it's @State loaded from cta, not @AppStorage. 0 = off.
-    @State private var idleEvictMinutes: Int = 0
+    // app pref — so it's @State loaded from cta, not @AppStorage. 0 = off;
+    // missing settings use the poller's recommended 15-minute default.
+    @State private var idleEvictMinutes: Int = 15
     private let idleEvictPresets = [15, 30, 60, 120]
-    private let defaultIdleEvictMinutes = 30
+    private let defaultIdleEvictMinutes = 15
 
     // Mid-turn auto-steer is also agent state (settings.json via cta). Default
     // true — mirrors the poller's out-of-box default.
@@ -265,7 +266,7 @@ private struct PagerTab: View {
             } header: {
                 Text("Idle sessions")
             } footer: {
-                Text("When a topic stays quiet this long, its Claude session closes to free memory — your next message resumes the same conversation after a short delay. If the conversation has grown large, it's also reset to a fresh session so replies stay fast and cheap; the bot saves the important context to its memory first, so it doesn't forget what matters. Off by default.")
+                Text("When a topic stays quiet this long, its Claude session closes to free memory — your next message resumes the same conversation after a short delay. If the conversation has grown large, it's also reset to a fresh session so replies stay fast and cheap; the bot saves the important context to its memory first, so it doesn't forget what matters. On by default (15 min).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

@@ -19,6 +19,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
+import { createTranscriptCursor, type TranscriptEvent } from "./transcript-cursor";
 
 export interface TurnEndInfo {
   costUsd: number | null;
@@ -55,33 +56,11 @@ export interface ClaudeDaemonOptions {
   env?: Record<string, string>;
 }
 
-interface AssistantContent {
-  type: string;
-  text?: string;
-}
-
-interface AssistantEvent {
-  type: "assistant";
-  message?: {
-    model?: string;
-    content?: AssistantContent[];
-  };
-}
-
-interface ResultEvent {
-  type: "result";
-  subtype?: string;
-  is_error?: boolean;
-  result?: string;
-  total_cost_usd?: number;
-  session_id?: string;
-}
-
 export class ClaudeDaemon extends EventEmitter {
   private readonly opts: ClaudeDaemonOptions;
   private proc: ChildProcess | null = null;
   private alive = false;
-  private stdoutBuffer = "";
+  private readonly transcript = createTranscriptCursor();
 
   constructor(opts: ClaudeDaemonOptions) {
     super();
@@ -109,6 +88,10 @@ export class ClaudeDaemon extends EventEmitter {
     });
     this.proc = proc;
     this.alive = true;
+    const started = new Promise<void>((resolve, reject) => {
+      proc.once("spawn", resolve);
+      proc.once("error", reject);
+    });
 
     proc.stdout!.setEncoding("utf8");
     proc.stdout!.on("data", (chunk: string) => this.onStdout(chunk));
@@ -118,9 +101,12 @@ export class ClaudeDaemon extends EventEmitter {
       // Surface as a log-level event; callers decide whether to log.
       this.emit("stderr", chunk);
     });
-    proc.on("error", (err) => {
+    proc.on("error", () => {
       this.alive = false;
-      this.emit("error", err);
+      // `error` is a special EventEmitter event which throws when nobody is
+      // listening. start() owns spawn failures through `started`; later child
+      // failures are followed by `close`, which emits the registry's crash
+      // signal below.
     });
     proc.on("close", (code, signal) => {
       this.alive = false;
@@ -129,6 +115,14 @@ export class ClaudeDaemon extends EventEmitter {
       // 'crash' handler decides whether to respawn.
       this.emit("crash", { code, signal });
     });
+
+    try {
+      await started;
+    } catch (error) {
+      this.alive = false;
+      this.proc = null;
+      throw error;
+    }
 
     // Tiny delay so the subprocess has a moment to wire its stdio. Without
     // this, the first send() can race the child's stdin reader setup on
@@ -224,49 +218,23 @@ export class ClaudeDaemon extends EventEmitter {
    * buffer until we see a newline.
    */
   private onStdout(chunk: string): void {
-    this.stdoutBuffer += chunk;
-    let nl: number;
-    while ((nl = this.stdoutBuffer.indexOf("\n")) >= 0) {
-      const line = this.stdoutBuffer.slice(0, nl);
-      this.stdoutBuffer = this.stdoutBuffer.slice(nl + 1);
-      if (!line.trim()) continue;
-      this.handleEvent(line);
+    for (const event of this.transcript.push(chunk)) {
+      this.handleEvent(event);
     }
   }
 
-  private handleEvent(line: string): void {
-    let event: unknown;
-    try {
-      event = JSON.parse(line);
-    } catch {
-      // Partial / non-JSON noise — claude emits a few non-JSON lines at
-      // startup occasionally. Skip silently.
+  private handleEvent(event: TranscriptEvent): void {
+    if (event.type === "assistant") {
+      this.emit("text", event.text);
       return;
     }
-    if (!event || typeof event !== "object") return;
-    const e = event as { type?: string };
-    if (e.type === "assistant") {
-      const a = e as AssistantEvent;
-      const blocks = a.message?.content ?? [];
-      for (const block of blocks) {
-        if (block.type === "text" && typeof block.text === "string" && block.text.length > 0) {
-          this.emit("text", block.text);
-        }
-      }
-      return;
-    }
-    if (e.type === "result") {
-      const r = e as ResultEvent;
-      const info: TurnEndInfo = {
-        costUsd: typeof r.total_cost_usd === "number" ? r.total_cost_usd : null,
-        sessionId: r.session_id ?? null,
-      };
-      this.emit("turn-end", info);
-      if (r.is_error === true) this.emit("turn-error", { result: r.result ?? "" });
-      return;
-    }
-    // 'system' init events and partial messages are not user-visible —
-    // we ignore them. Callers can re-derive cost / session from result.
+
+    const info: TurnEndInfo = {
+      costUsd: event.costUsd ?? null,
+      sessionId: event.sessionId ?? null,
+    };
+    this.emit("turn-end", info);
+    if (event.isError === true) this.emit("turn-error", { result: event.result ?? "" });
   }
 
   /**

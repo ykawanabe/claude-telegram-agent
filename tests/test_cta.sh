@@ -397,12 +397,12 @@ IE_OFF=$(cmd_config idle-evict 2>/dev/null)
 cmd_config idle-evict abc >/dev/null 2>&1 && ng "cmd_config idle-evict abc: should exit non-zero" \
   || ok "cmd_config idle-evict abc: rejected with non-zero exit"
 
-# no-arg with missing file → prints 0, no python traceback
+# no-arg with missing file → prints recommended default 15, no traceback
 rm -f "$SETTINGS_FILE"
 IE_MISSING=$(cmd_config idle-evict 2>/dev/null)
-[[ "$IE_MISSING" == "0" ]] \
-  && ok "cmd_config idle-evict (no arg, missing file): prints 0" \
-  || ng "cmd_config idle-evict (no arg, missing file): expected 0, got '$IE_MISSING'"
+[[ "$IE_MISSING" == "15" ]] \
+  && ok "cmd_config idle-evict (no arg, missing file): prints 15" \
+  || ng "cmd_config idle-evict (no arg, missing file): expected 15, got '$IE_MISSING'"
 rm -rf "$IE_TMP"
 
 rm -rf "$CFG_TMP"
